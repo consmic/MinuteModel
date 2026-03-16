@@ -1,0 +1,239 @@
+# MinuteModel V1: Draft-Only LoL Match Duration Regression
+
+MinuteModel V1 predicts professional League of Legends match duration **immediately after champion draft**, using Oracle's Elixir-style CSV input.
+
+This is a **draft-only benchmark model** designed to be:
+- leakage-safe
+- chronological (time-aware) in validation
+- modular and extensible for future in-game telemetry models
+
+## What This Project Builds
+
+- Schema inspection for raw Oracle's Elixir row structure
+- Safe flattening from multi-row raw data to **one row per match (`gameid`)**
+- Leakage-safe historical team rolling priors (duration and optional CKPM)
+- Draft feature generation:
+  - role-aware champions (when available)
+  - bag-of-champions fallback (configurable)
+- Baseline models:
+  - global mean
+  - league mean
+  - league + patch mean
+  - ridge regression
+- Main model: LightGBM regressor
+- Strict chronological split (train/validation/test by date order)
+- Evaluation outputs (MAE/RMSE/MedAE + within-2/5 minutes)
+- Residual and error breakdown plots
+- SHAP diagnostics (global + local)
+- Inference API for single pre-game input
+
+## Project Structure
+
+- `minutemodel/data_loading.py`
+- `minutemodel/schema_inspection.py`
+- `minutemodel/preprocessing.py`
+- `minutemodel/feature_engineering.py`
+- `minutemodel/baselines.py`
+- `minutemodel/train.py`
+- `minutemodel/evaluate.py`
+- `minutemodel/inference.py`
+- `minutemodel/config.py`
+- `minutemodel/utils.py`
+- `minutemodel/main.py`
+- `main.py` (entrypoint wrapper)
+- `config/example_config.yaml`
+
+## Installation
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+## Data Assumptions and Schema Handling
+
+Oracle's Elixir files often contain multiple rows per match (player and/or team rows). This project inspects and handles that explicitly.
+
+### Schema inspection diagnostics
+
+`inspect` reports:
+- row counts by `gameid`
+- row distributions by `participantid`, `side`, and `position`
+- whether team rows exist (for example `position=team`)
+- draft field duplication rates across row types
+- `gamelength` unit guess (seconds vs minutes)
+
+### Match-level flattening
+
+Flattening uses `gameid` and side normalization (`Blue`/`Red`) to construct one row per game with fields such as:
+- `blue_team_id`, `red_team_id`
+- `blue_team_name`, `red_team_name`
+- side draft champions (role-aware if recoverable)
+- side bans/pick slots
+- `target_gamelength_seconds`
+- `target_gamelength_minutes`
+
+If role recovery is incomplete, the pipeline falls back to bag-of-champions features from picks/champion rows.
+
+Assumptions used when schema is ambiguous:
+- side is normalized to `Blue`/`Red` from common tokens (`blue/red`, `100/200`, etc.)
+- repeated draft values across player/team rows are resolved by stable mode-first selection
+- team identity uses `teamid` when available, otherwise `teamname`
+- only matches with both sides present are retained in V1
+
+## Leakage Policy
+
+Version 1 only uses features known at draft completion.
+
+### Allowed feature families (V1)
+- pre-game metadata (`league`, `year`, `split`, `playoffs`, `date`, `patch`, side/team identity)
+- draft fields (`champion`, `pick1`-`pick5`, `ban1`-`ban5`, role champs)
+- strictly historical rolling priors computed from **previous** matches only
+
+### Forbidden feature families (V1)
+No current-match in-game/post-game outcomes, including:
+- result and combat stats (`kills`, `deaths`, `assists`, etc.)
+- objectives (`dragons`, `barons`, `towers`, etc.)
+- gold/xp/cs progression or snapshot features (including `@10/@15/@20/@25` and `*diffat*` fields)
+
+The code enforces forbidden feature checks before modeling.
+Concrete lists are defined in `minutemodel/config.py` as `ALLOWED_COLUMNS`, `FORBIDDEN_COLUMNS`, and `FORBIDDEN_COLUMN_PATTERNS`.
+
+## Rolling Priors (Leakage-Safe)
+
+For each team-side row in chronological order:
+- rolling 10-game average duration (shifted by 1 match)
+- optional rolling 10-game CKPM (shifted by 1 match)
+
+Fallback chain when history is short:
+1. league expanding prior (historical only)
+2. global expanding prior (historical only)
+3. dataset mean fallback if still missing
+
+## Configuration
+
+Use YAML config (see `config/example_config.yaml`).
+`input_csv` can be a single CSV path or a glob pattern (for example yearly files like `data/*_LoL_esports_match_data_from_OraclesElixir.csv`).
+
+Required/important options:
+- `use_role_specific_draft_features`
+- `use_bag_of_champions_fallback`
+- `target_unit` (`seconds` or `minutes`)
+- `rolling_window_size`
+- `use_champion_scaling_features`
+
+Default setup is robust V1:
+- target in seconds internally
+- role-specific + bag-of-champions enabled
+- rolling window size 10
+
+## CLI Usage
+
+### 1) Inspect schema
+
+```bash
+python main.py inspect --config config/example_config.yaml --output-report reports/schema_report.txt
+```
+
+### 2) Build match-level table only
+
+```bash
+python main.py flatten --config config/example_config.yaml --output-csv artifacts/match_level_table.csv
+```
+
+### 3) Train + evaluate + SHAP
+
+```bash
+python main.py train --config config/example_config.yaml
+```
+
+Outputs include:
+- `artifacts/model_artifacts.joblib`
+- `artifacts/match_level_table.csv`
+- `reports/benchmark_summary.csv`
+- `reports/metrics_summary.json`
+- residual/error breakdown plots
+- `reports/shap/` diagnostics
+
+### 4) Inference on one draft payload
+
+```bash
+python main.py predict --artifact-path artifacts/model_artifacts.joblib --input-json sample_input.json --explain
+```
+
+Returned fields:
+- `predicted_duration_seconds`
+- `predicted_duration_minutes`
+- optional SHAP explanation payload
+
+### 5) Frontend app for upcoming-game predictions
+
+Run the Streamlit app:
+
+```bash
+streamlit run frontend_app.py
+```
+
+In the app:
+- choose your `model_artifacts.joblib`
+- enter upcoming match metadata and full draft
+- optionally auto-fill team priors from `artifacts/match_level_table.csv`
+- click **Predict Match Duration**
+
+## Deploy To Streamlit Community Cloud
+
+1. Push this project to a GitHub repo.
+2. Make sure these files are present in that repo:
+   - `frontend_app.py`
+   - `minutemodel/`
+   - `requirements.txt`
+   - `artifacts/model_artifacts.joblib`
+   - optionally `artifacts/match_level_table.csv` for prior auto-fill
+3. In Streamlit Community Cloud, click **Create app** and select:
+   - Repository: your repo
+   - Branch: your deployment branch (for example `main`)
+   - Main file path: `frontend_app.py`
+4. Deploy, then open the app URL.
+
+Notes:
+- If the build fails on `shap`, remove `shap` from `requirements.txt` (the app still runs; explanations become optional).
+- Use forward-slash paths in the app configuration (`artifacts/model_artifacts.joblib`).
+
+## Evaluation Metrics
+
+Headline metric:
+- MAE (minutes)
+
+Secondary metrics:
+- RMSE (minutes)
+- Median Absolute Error (minutes)
+- within-2-minute accuracy
+- within-5-minute accuracy
+- MAE (seconds) optional reference
+
+## Benchmarking Guidance
+
+Always interpret LightGBM against baselines:
+- global mean
+- league mean
+- league + patch mean
+- ridge regression
+
+If draft-only model gains are small, that still sets a useful pre-game benchmark.
+
+## Important Modeling Context
+
+Draft-only duration prediction is inherently noisy. It should not be treated as directly equivalent to models using in-game telemetry.
+
+Expected progression:
+- V1 (this repo): draft-only benchmark
+- V2: add live-state features (for example 10-minute telemetry) for stronger predictability
+
+## Extending to Version 2 (10-Minute Telemetry)
+
+Suggested path:
+1. Keep current match-level draft pipeline as static pre-game branch.
+2. Add a telemetry branch with snapshot features at fixed game time (for example 10:00).
+3. Train hybrid model: draft priors + telemetry state.
+4. Evaluate with identical chronological protocol and baseline controls.
+
+This preserves comparability while quantifying incremental value from live game state.

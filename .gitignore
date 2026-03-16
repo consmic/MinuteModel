@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data and artifacts
+data/
+artifacts/*
+!artifacts/model_artifacts.joblib
+!artifacts/match_level_table.csv
+reports/
+outputs/
+*.joblib
+!artifacts/model_artifacts.joblib
+*.pkl
+
+# Notebook and IDE noise
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
