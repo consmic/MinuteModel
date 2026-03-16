@@ -175,7 +175,8 @@ streamlit run frontend_app.py
 
 In the app:
 - choose your `model_artifacts.joblib`
-- enter upcoming match metadata and full draft
+- optionally prefill from a recent historical match template
+- enter upcoming match metadata and full draft (or quick-paste roles as `top,jng,mid,bot,sup`)
 - optionally auto-fill team priors from `artifacts/match_level_table.csv`
 - click **Predict Match Duration**
 
