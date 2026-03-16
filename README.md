@@ -15,12 +15,14 @@ This is a **draft-only benchmark model** designed to be:
 - Draft feature generation:
   - role-aware champions (when available)
   - bag-of-champions fallback (configurable)
+  - optional champion scaling / composition pace priors (configurable)
 - Baseline models:
   - global mean
   - league mean
   - league + patch mean
   - ridge regression
-- Main model: LightGBM regressor
+- Primary model (default): CatBoost regressor
+- Optional primary model: LightGBM regressor
 - Strict chronological split (train/validation/test by date order)
 - Evaluation outputs (MAE/RMSE/MedAE + within-2/5 minutes)
 - Residual and error breakdown plots
@@ -33,6 +35,7 @@ This is a **draft-only benchmark model** designed to be:
 - `minutemodel/schema_inspection.py`
 - `minutemodel/preprocessing.py`
 - `minutemodel/feature_engineering.py`
+- `minutemodel/champion_scaling.py`
 - `minutemodel/baselines.py`
 - `minutemodel/train.py`
 - `minutemodel/evaluate.py`
@@ -109,17 +112,57 @@ Fallback chain when history is short:
 2. global expanding prior (historical only)
 3. dataset mean fallback if still missing
 
+## Champion Scaling / Composition Pace Features (Optional)
+
+When `use_champion_scaling_features: true`, the pipeline adds engineered draft priors based on champion tendencies in historical training data.
+
+How coefficients are built:
+- fit on **training split only** (never on validation/test before scoring)
+- per champion: `avg_game_length_seconds_when_picked - global_train_avg_seconds`
+- optional smoothing shrinkage for low-sample champions (`champion_scaling_min_samples`)
+- optional patch-aware coefficients (fall back to champion-level prior when patch sample is small)
+- optional recency weighting (half-life in days)
+
+Leakage rule:
+- the lookup is fit only inside training (`DraftFeatureBuilder.fit(train_df)`)
+- validation/test/inference rows only receive mapped values from that fitted lookup
+- unseen champions fall back to `0.0` (global prior delta)
+
+Aggregated team features:
+- `blue_scaling_sum`, `red_scaling_sum`
+- `blue_scaling_mean`, `red_scaling_mean`
+- `blue_scaling_max`, `red_scaling_max`
+- `blue_scaling_min`, `red_scaling_min`
+- `blue_scaling_known_count`, `red_scaling_known_count`
+- `scaling_diff` (blue minus red)
+
+Interpretation:
+- these are handcrafted priors, not causal truth
+- they complement (do not replace) raw champion identity features
+
 ## Configuration
 
 Use YAML config (see `config/example_config.yaml`).
 `input_csv` can be a single CSV path or a glob pattern (for example yearly files like `data/*_LoL_esports_match_data_from_OraclesElixir.csv`).
 
 Required/important options:
+- `primary_model` (`catboost` or `lightgbm`)
 - `use_role_specific_draft_features`
 - `use_bag_of_champions_fallback`
 - `target_unit` (`seconds` or `minutes`)
 - `rolling_window_size`
 - `use_champion_scaling_features`
+- `champion_scaling_method` (`avg_duration_delta`)
+- `champion_scaling_smoothing`
+- `champion_scaling_min_samples`
+- `champion_scaling_recency_weighting`
+- `champion_scaling_recency_half_life_days`
+- `champion_scaling_patch_aware`
+- `run_champion_scaling_ablation`
+- `catboost_iterations`
+- `catboost_early_stopping_rounds`
+- `catboost_param_grid`
+- `lgbm_param_grid` (used when `primary_model: lightgbm`)
 
 Default setup is robust V1:
 - target in seconds internally
@@ -151,6 +194,9 @@ Outputs include:
 - `artifacts/match_level_table.csv`
 - `reports/benchmark_summary.csv`
 - `reports/metrics_summary.json`
+- `reports/champion_scaling_ablation.csv` (with/without scaling for current primary model)
+- `reports/champion_scaling_lookup.csv` (if scaling enabled)
+- `artifacts/champion_scaling_lookup.joblib` (if scaling enabled)
 - residual/error breakdown plots
 - `reports/shap/` diagnostics
 
@@ -213,7 +259,7 @@ Secondary metrics:
 
 ## Benchmarking Guidance
 
-Always interpret LightGBM against baselines:
+Always interpret the primary model against baselines:
 - global mean
 - league mean
 - league + patch mean

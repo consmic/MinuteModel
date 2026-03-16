@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.impute import SimpleImputer
 
 try:
     import shap  # type: ignore
@@ -15,11 +16,48 @@ except Exception:  # pragma: no cover - optional dependency guard
 
 def load_artifacts(path: str | Path) -> Dict[str, Any]:
     artifacts = joblib.load(path)
-    required = {"model", "preprocessor", "feature_builder", "feature_names"}
+    required = {"model", "feature_builder"}
     missing = sorted(required - set(artifacts.keys()))
     if missing:
         raise ValueError(f"Model artifacts missing keys: {missing}")
+
+    artifacts.setdefault("preprocessor", None)
+    artifacts.setdefault("feature_names", [])
+    artifacts.setdefault("primary_model", "lightgbm")
+    _patch_simple_imputer_compat(artifacts)
     return artifacts
+
+
+def _patch_simple_imputer_compat(root: Any) -> None:
+    """Bridge sklearn private attr renames across versions for unpickled pipelines."""
+    seen: set[int] = set()
+
+    def _walk(node: Any) -> None:
+        node_id = id(node)
+        if node_id in seen:
+            return
+        seen.add(node_id)
+
+        if isinstance(node, SimpleImputer):
+            if hasattr(node, "_fit_dtype") and not hasattr(node, "_fill_dtype"):
+                setattr(node, "_fill_dtype", getattr(node, "_fit_dtype"))
+            if hasattr(node, "_fill_dtype") and not hasattr(node, "_fit_dtype"):
+                setattr(node, "_fit_dtype", getattr(node, "_fill_dtype"))
+
+        if isinstance(node, dict):
+            for value in node.values():
+                _walk(value)
+            return
+        if isinstance(node, (list, tuple, set)):
+            for value in node:
+                _walk(value)
+            return
+
+        if hasattr(node, "__dict__"):
+            for value in vars(node).values():
+                _walk(value)
+
+    _walk(root)
 
 
 def _prepare_single_input(payload: Dict[str, Any]) -> pd.DataFrame:
@@ -83,14 +121,27 @@ def predict_single_draft(
     model = artifacts["model"]
     preprocessor = artifacts["preprocessor"]
     feature_builder = artifacts["feature_builder"]
-    feature_names = artifacts["feature_names"]
+    feature_names = artifacts.get("feature_names", [])
+    primary_model = str(artifacts.get("primary_model", "lightgbm")).lower()
+    catboost_categorical_cols = artifacts.get("catboost_categorical_cols", []) or []
+    catboost_numeric_cols = artifacts.get("catboost_numeric_cols", []) or []
     config = artifacts.get("config", {})
     target_unit = str(config.get("target_unit", "seconds")).lower()
     unit_to_seconds = 60.0 if target_unit == "minutes" else 1.0
 
     input_df = _prepare_single_input(draft_payload)
     feature_df = feature_builder.transform(input_df)
-    transformed = preprocessor.transform(feature_df)
+    if preprocessor is not None:
+        transformed = preprocessor.transform(feature_df)
+    else:
+        transformed = feature_df.copy()
+        if primary_model == "catboost":
+            for col in catboost_categorical_cols:
+                if col in transformed.columns:
+                    transformed[col] = transformed[col].astype(str).fillna("__MISSING__")
+            for col in catboost_numeric_cols:
+                if col in transformed.columns:
+                    transformed[col] = pd.to_numeric(transformed[col], errors="coerce")
 
     pred_model_unit = float(model.predict(transformed)[0])
     pred_seconds = pred_model_unit * unit_to_seconds
@@ -101,10 +152,11 @@ def predict_single_draft(
     }
 
     if include_explanation:
+        explanation_feature_names = feature_names if feature_names else list(feature_df.columns)
         response["explanation"] = _explain_single_prediction(
             model=model,
             transformed_row=transformed,
-            feature_names=feature_names,
+            feature_names=explanation_feature_names,
             top_k=10,
         )
         response["explanation"]["model_output_unit"] = target_unit

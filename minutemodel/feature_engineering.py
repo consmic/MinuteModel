@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MultiLabelBinarizer
 
+from .champion_scaling import ChampionScalingLookup
 from .config import PipelineConfig, is_forbidden_feature_column
 
 LOGGER = logging.getLogger(__name__)
@@ -179,6 +180,7 @@ class DraftFeatureBuilder:
     config: PipelineConfig
     blue_mlb: MultiLabelBinarizer = field(default_factory=MultiLabelBinarizer)
     red_mlb: MultiLabelBinarizer = field(default_factory=MultiLabelBinarizer)
+    champion_scaling_lookup_: Optional[ChampionScalingLookup] = None
     fitted: bool = False
 
     categorical_columns_: List[str] = field(default_factory=list)
@@ -187,6 +189,18 @@ class DraftFeatureBuilder:
     red_classes_set_: set[str] = field(default_factory=set)
 
     def fit(self, match_df: pd.DataFrame) -> "DraftFeatureBuilder":
+        if self.config.use_champion_scaling_features:
+            self.champion_scaling_lookup_ = ChampionScalingLookup(
+                method=self.config.champion_scaling_method,
+                smoothing=self.config.champion_scaling_smoothing,
+                min_samples=self.config.champion_scaling_min_samples,
+                recency_weighting=self.config.champion_scaling_recency_weighting,
+                recency_half_life_days=self.config.champion_scaling_recency_half_life_days,
+                patch_aware=self.config.champion_scaling_patch_aware,
+            ).fit(match_df)
+        else:
+            self.champion_scaling_lookup_ = None
+
         if self.config.use_bag_of_champions_fallback:
             blue_lists = match_df["blue_draft_champions"].apply(_sanitize_draft_list)
             red_lists = match_df["red_draft_champions"].apply(_sanitize_draft_list)
@@ -299,11 +313,18 @@ class DraftFeatureBuilder:
             features["blue_has_unknown_champion"] = blue_unknown.to_numpy(dtype=float)
             features["red_has_unknown_champion"] = red_unknown.to_numpy(dtype=float)
 
-        # Optional champion scaling features: placeholder hook for future map integration.
         if self.config.use_champion_scaling_features:
-            features["blue_scaling_score"] = np.nan
-            features["red_scaling_score"] = np.nan
-            features["scaling_score_diff"] = np.nan
+            if self.champion_scaling_lookup_ is None:
+                raise RuntimeError(
+                    "Champion scaling features were requested but ChampionScalingLookup is missing. "
+                    "Call fit() on DraftFeatureBuilder before transform()."
+                )
+            scaling_df = self.champion_scaling_lookup_.transform(
+                match_df,
+                prefer_role_specific=self.config.use_role_specific_draft_features,
+            )
+            for col in scaling_df.columns:
+                features[col] = pd.to_numeric(scaling_df[col], errors="coerce")
 
         # Columns by dtype for downstream preprocessing.
         categorical_columns = [
@@ -324,6 +345,20 @@ class DraftFeatureBuilder:
 
     def get_feature_columns(self) -> Tuple[List[str], List[str]]:
         return self.categorical_columns_, self.numeric_columns_
+
+    def get_champion_scaling_lookup_table(self) -> pd.DataFrame:
+        if self.champion_scaling_lookup_ is None:
+            return pd.DataFrame(
+                columns=[
+                    "champion",
+                    "sample_size",
+                    "champion_avg_seconds",
+                    "scaling_coeff",
+                    "smoothed_scaling_coeff",
+                    "patch_count",
+                ]
+            )
+        return self.champion_scaling_lookup_.to_lookup_table()
 
 
 def build_target(match_df: pd.DataFrame, config: PipelineConfig) -> pd.Series:

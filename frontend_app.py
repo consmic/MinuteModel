@@ -76,7 +76,18 @@ def _load_test_mae_minutes(metrics_path: str) -> Optional[float]:
     if not path.exists():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
-    return payload.get("metrics_by_model", {}).get("lightgbm", {}).get("mae_minutes")
+    metrics = payload.get("metrics_by_model", {})
+    if "lightgbm" in metrics and "mae_minutes" in metrics["lightgbm"]:
+        return metrics["lightgbm"]["mae_minutes"]
+
+    primary = payload.get("primary_model")
+    if primary and primary in metrics and "mae_minutes" in metrics[primary]:
+        return metrics[primary]["mae_minutes"]
+
+    for model_name in ["catboost", "ridge_regression", "global_mean"]:
+        if model_name in metrics and "mae_minutes" in metrics[model_name]:
+            return metrics[model_name]["mae_minutes"]
+    return None
 
 
 def _extract_ui_options(match_df: pd.DataFrame) -> Dict[str, Any]:

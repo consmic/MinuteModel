@@ -2,11 +2,19 @@ input_csv: data/*_LoL_esports_match_data_from_OraclesElixir.csv
 output_dir: artifacts
 reports_dir: reports
 
+primary_model: catboost
 use_role_specific_draft_features: true
 use_bag_of_champions_fallback: true
 target_unit: seconds
 rolling_window_size: 10
 use_champion_scaling_features: false
+champion_scaling_method: avg_duration_delta
+champion_scaling_smoothing: true
+champion_scaling_min_samples: 20
+champion_scaling_recency_weighting: false
+champion_scaling_recency_half_life_days: 180
+champion_scaling_patch_aware: true
+run_champion_scaling_ablation: true
 use_rolling_ckpm_prior: true
 
 train_fraction: 0.70
@@ -14,6 +22,20 @@ validation_fraction: 0.15
 test_fraction: 0.15
 
 random_seed: 42
+
+catboost_iterations: 1600
+catboost_early_stopping_rounds: 120
+catboost_param_grid:
+  - depth: 5
+    learning_rate: 0.03
+    l2_leaf_reg: 9.0
+    bagging_temperature: 0.5
+    random_strength: 1.0
+  - depth: 6
+    learning_rate: 0.05
+    l2_leaf_reg: 3.0
+    bagging_temperature: 0.0
+    random_strength: 0.0
 
 lgbm_param_grid:
   - n_estimators: 400

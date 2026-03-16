@@ -131,11 +131,19 @@ class PipelineConfig:
     output_dir: str = "artifacts"
     reports_dir: str = "reports"
 
+    primary_model: str = "catboost"
     use_role_specific_draft_features: bool = True
     use_bag_of_champions_fallback: bool = True
     target_unit: str = "seconds"
     rolling_window_size: int = 10
     use_champion_scaling_features: bool = False
+    champion_scaling_method: str = "avg_duration_delta"
+    champion_scaling_smoothing: bool = True
+    champion_scaling_min_samples: int = 20
+    champion_scaling_recency_weighting: bool = False
+    champion_scaling_recency_half_life_days: int = 180
+    champion_scaling_patch_aware: bool = True
+    run_champion_scaling_ablation: bool = True
     use_rolling_ckpm_prior: bool = True
 
     train_fraction: float = 0.70
@@ -143,6 +151,27 @@ class PipelineConfig:
     test_fraction: float = 0.15
 
     random_seed: int = 42
+
+    catboost_iterations: int = 1600
+    catboost_early_stopping_rounds: int = 120
+    catboost_param_grid: List[Dict[str, Any]] = field(
+        default_factory=lambda: [
+            {
+                "depth": 5,
+                "learning_rate": 0.03,
+                "l2_leaf_reg": 9.0,
+                "bagging_temperature": 0.5,
+                "random_strength": 1.0,
+            },
+            {
+                "depth": 6,
+                "learning_rate": 0.05,
+                "l2_leaf_reg": 3.0,
+                "bagging_temperature": 0.0,
+                "random_strength": 0.0,
+            },
+        ]
+    )
 
     lgbm_param_grid: List[Dict[str, Any]] = field(
         default_factory=lambda: [
@@ -193,12 +222,31 @@ class PipelineConfig:
             yaml.safe_dump(self.to_dict(), handle, sort_keys=False)
 
     def validate(self) -> None:
+        if self.primary_model not in {"catboost", "lightgbm"}:
+            raise ValueError("primary_model must be 'catboost' or 'lightgbm'.")
+
         if self.target_unit not in {"seconds", "minutes"}:
             raise ValueError("target_unit must be 'seconds' or 'minutes'.")
 
         total = self.train_fraction + self.validation_fraction + self.test_fraction
         if abs(total - 1.0) > 1e-8:
             raise ValueError("train_fraction + validation_fraction + test_fraction must equal 1.0.")
+
+        if self.catboost_iterations < 1:
+            raise ValueError("catboost_iterations must be >= 1.")
+        if self.catboost_early_stopping_rounds < 1:
+            raise ValueError("catboost_early_stopping_rounds must be >= 1.")
+        if self.primary_model == "catboost" and len(self.catboost_param_grid) == 0:
+            raise ValueError("catboost_param_grid must contain at least one candidate when primary_model='catboost'.")
+        if self.primary_model == "lightgbm" and len(self.lgbm_param_grid) == 0:
+            raise ValueError("lgbm_param_grid must contain at least one candidate when primary_model='lightgbm'.")
+
+        if self.champion_scaling_method != "avg_duration_delta":
+            raise ValueError("champion_scaling_method currently supports only 'avg_duration_delta'.")
+        if self.champion_scaling_min_samples < 1:
+            raise ValueError("champion_scaling_min_samples must be >= 1.")
+        if self.champion_scaling_recency_half_life_days < 1:
+            raise ValueError("champion_scaling_recency_half_life_days must be >= 1.")
 
 
 def is_forbidden_feature_column(column_name: str) -> bool:
