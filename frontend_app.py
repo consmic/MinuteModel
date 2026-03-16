@@ -1,866 +1,1149 @@
 from __future__ import annotations
 
-import json
+import math
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-from minutemodel.inference import load_artifacts, predict_single_draft
-
-ROLE_ORDER = ["top", "jng", "mid", "bot", "sup"]
-
-
-def _clean_text(value: Any) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if text.lower() in {"nan", "none"}:
-        return ""
-    return text
-
-
-def _parse_champion_list(value: Any) -> List[str]:
-    if isinstance(value, list):
-        return [_clean_text(v) for v in value if _clean_text(v)]
-    text = _clean_text(value)
-    if not text:
-        return []
-    if text.startswith("[") and text.endswith("]"):
-        inner = text[1:-1].replace("'", "").replace('"', "")
-        return [token.strip() for token in inner.split(",") if token.strip()]
-    return [text]
-
-
-def _normalize_team_id(value: Any) -> str:
-    text = _clean_text(value)
-    if not text:
-        return ""
-    try:
-        as_float = float(text)
-        if as_float.is_integer():
-            return str(int(as_float))
-    except Exception:
-        pass
-    return text
+from frontend_ui import (
+    FREE_PREDICTIONS_PER_MONTH,
+    ROLE_ORDER,
+    apply_app_styles,
+    apply_template_to_defaults,
+    append_journal_entry,
+    build_calendar_board,
+    build_payload,
+    clean_text,
+    compute_journal_metrics,
+    default_form_state,
+    ensure_form_state,
+    ensure_usage_state,
+    extract_ui_options,
+    get_usage_snapshot,
+    increment_usage,
+    load_artifacts_cached,
+    load_journal,
+    load_match_table,
+    load_metrics_payload,
+    load_test_mae_minutes,
+    lookup_team_priors,
+    options_with_current,
+    parse_role_quick_input,
+    recent_template_rows,
+    reset_usage,
+    save_journal,
+    swap_form_sides,
+    team_history_view,
+    validate_draft_inputs,
+)
+from minutemodel.inference import predict_single_draft
 
 
-def _options_with_current(options: List[str], current: str) -> List[str]:
-    clean_options = [opt for opt in sorted({_clean_text(v) for v in options}) if opt]
-    current_clean = _clean_text(current)
-    if current_clean and current_clean not in clean_options:
-        clean_options = [current_clean] + clean_options
-    return [""] + clean_options
+NAV_ITEMS = [
+    "Home",
+    "Predictions",
+    "Calendar",
+    "Journal",
+    "Model Performance",
+    "Account / Usage",
+]
+
+SUPPORTED_GAMES = [
+    "League of Legends",
+    "Counter-Strike 2",
+    "Dota 2",
+    "VALORANT",
+]
+
+DEFAULT_ARTIFACT_PATH = "artifacts/model_artifacts.joblib"
+DEFAULT_MATCH_TABLE_PATH = "artifacts/match_level_table.csv"
+DEFAULT_METRICS_PATH = "reports/metrics_summary.json"
+DEFAULT_JOURNAL_PATH = "reports/prediction_journal.csv"
 
 
-@st.cache_resource
-def _load_artifacts_cached(path: str) -> Dict[str, Any]:
-    return load_artifacts(path)
+@dataclass
+class AppContext:
+    artifact_path: Path
+    match_table_path: Path
+    metrics_path: Path
+    journal_path: Path
+    include_explanation: bool
+    artifacts: Optional[Dict[str, Any]]
+    artifact_error: Optional[str]
+    config: Dict[str, Any]
+    match_df: pd.DataFrame
+    options: Dict[str, Any]
+    team_history: pd.DataFrame
+    template_rows: pd.DataFrame
+    calendar_board: pd.DataFrame
+    metrics_payload: Dict[str, Any]
+    test_mae_minutes: Optional[float]
 
 
-@st.cache_data
-def _load_match_table(path: str) -> pd.DataFrame:
-    table_path = Path(path)
-    if not table_path.exists():
-        return pd.DataFrame()
-    df = pd.read_csv(table_path, low_memory=False)
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=False)
-    return df
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
 
 
-@st.cache_data
-def _load_test_mae_minutes(metrics_path: str) -> Optional[float]:
-    path = Path(metrics_path)
-    if not path.exists():
-        return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    metrics = payload.get("metrics_by_model", {})
-    if "lightgbm" in metrics and "mae_minutes" in metrics["lightgbm"]:
-        return metrics["lightgbm"]["mae_minutes"]
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    cast = pd.to_numeric(value, errors="coerce")
+    return float(cast) if pd.notna(cast) else float(default)
 
-    primary = payload.get("primary_model")
-    if primary and primary in metrics and "mae_minutes" in metrics[primary]:
-        return metrics[primary]["mae_minutes"]
 
-    for model_name in ["catboost", "ridge_regression", "global_mean"]:
-        if model_name in metrics and "mae_minutes" in metrics[model_name]:
-            return metrics[model_name]["mae_minutes"]
+def _clock_from_seconds(seconds: float) -> str:
+    total = max(int(round(seconds)), 0)
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def _default_year_from_table(match_df: pd.DataFrame) -> int:
+    now_year = int(pd.Timestamp.now(tz="UTC").year)
+    if match_df.empty or "date" not in match_df.columns:
+        return now_year
+    valid = match_df["date"].dropna()
+    if valid.empty:
+        return now_year
+    return int(valid.max().year)
+
+
+def _resolve_primary_metric(metrics_payload: Dict[str, Any], metric_name: str) -> Optional[float]:
+    metrics_by_model = metrics_payload.get("metrics_by_model", {})
+    primary_model = str(metrics_payload.get("primary_model", "")).lower()
+
+    if primary_model in metrics_by_model and metric_name in metrics_by_model[primary_model]:
+        return _safe_float(metrics_by_model[primary_model][metric_name], default=np.nan)
+
+    for fallback in ["catboost", "lightgbm", "ridge_regression", "global_mean"]:
+        if fallback in metrics_by_model and metric_name in metrics_by_model[fallback]:
+            return _safe_float(metrics_by_model[fallback][metric_name], default=np.nan)
     return None
 
 
-def _extract_ui_options(match_df: pd.DataFrame) -> Dict[str, Any]:
-    if match_df.empty:
-        return {
-            "leagues": [],
-            "patches": [],
-            "splits": [],
-            "team_names": [],
-            "team_ids": [],
-            "champions": [],
-            "duration_median": 1900.0,
-            "ckpm_median": 0.7,
-        }
+def _load_context(
+    artifact_path: str,
+    match_table_path: str,
+    metrics_path: str,
+    journal_path: str,
+    include_explanation: bool,
+) -> AppContext:
+    artifact_file = Path(artifact_path)
+    artifacts: Optional[Dict[str, Any]] = None
+    artifact_error: Optional[str] = None
 
-    def unique_values(cols: List[str]) -> List[str]:
-        tokens: List[str] = []
-        for col in cols:
-            if col in match_df.columns:
-                tokens.extend([_clean_text(v) for v in match_df[col].dropna().tolist()])
-        out = sorted({tok for tok in tokens if tok})
-        return out
+    if not artifact_file.exists():
+        artifact_error = f"Artifact file not found: {artifact_file}"
+    else:
+        try:
+            artifacts = load_artifacts_cached(str(artifact_file))
+        except Exception as exc:
+            artifact_error = f"Failed to load model artifacts: {exc}"
 
-    champions: List[str] = []
-    champion_cols = [
-        "blue_top_champion",
-        "blue_jng_champion",
-        "blue_mid_champion",
-        "blue_bot_champion",
-        "blue_sup_champion",
-        "red_top_champion",
-        "red_jng_champion",
-        "red_mid_champion",
-        "red_bot_champion",
-        "red_sup_champion",
-        "blue_pick1",
-        "blue_pick2",
-        "blue_pick3",
-        "blue_pick4",
-        "blue_pick5",
-        "red_pick1",
-        "red_pick2",
-        "red_pick3",
-        "red_pick4",
-        "red_pick5",
-    ]
-    for col in champion_cols:
-        if col in match_df.columns:
-            champions.extend([_clean_text(v) for v in match_df[col].dropna().tolist()])
+    match_df = load_match_table(match_table_path)
+    options = extract_ui_options(match_df)
+    team_history = team_history_view(match_df)
+    template_rows = recent_template_rows(match_df)
+    calendar_board = build_calendar_board(match_df)
+    metrics_payload = load_metrics_payload(metrics_path)
+    test_mae_minutes = load_test_mae_minutes(metrics_path)
 
-    for list_col in ["blue_draft_champions", "red_draft_champions"]:
-        if list_col in match_df.columns:
-            for value in match_df[list_col].dropna().tolist():
-                champions.extend(_parse_champion_list(value))
+    return AppContext(
+        artifact_path=artifact_file,
+        match_table_path=Path(match_table_path),
+        metrics_path=Path(metrics_path),
+        journal_path=Path(journal_path),
+        include_explanation=include_explanation,
+        artifacts=artifacts,
+        artifact_error=artifact_error,
+        config=artifacts.get("config", {}) if artifacts else {},
+        match_df=match_df,
+        options=options,
+        team_history=team_history,
+        template_rows=template_rows,
+        calendar_board=calendar_board,
+        metrics_payload=metrics_payload,
+        test_mae_minutes=test_mae_minutes,
+    )
 
-    duration_series = pd.to_numeric(
-        match_df.get("target_gamelength_seconds", pd.Series(dtype=float)),
-        errors="coerce",
-    ).dropna()
-    ckpm_values = pd.concat(
-        [
-            pd.to_numeric(match_df.get("blue_rolling_ckpm_prior", pd.Series(dtype=float)), errors="coerce"),
-            pd.to_numeric(match_df.get("red_rolling_ckpm_prior", pd.Series(dtype=float)), errors="coerce"),
-        ],
-        axis=0,
-    ).dropna()
+
+def _render_top_nav() -> str:
+    if "nav_page" not in st.session_state:
+        st.session_state["nav_page"] = "Home"
+
+    with st.sidebar:
+        st.markdown("### MinuteModel")
+        st.caption("Esports prediction workspace")
+        selected = st.radio("Navigate", NAV_ITEMS, key="nav_page")
+    return selected
+
+
+def _render_sidebar_settings() -> Dict[str, Any]:
+    if "artifact_path" not in st.session_state:
+        st.session_state["artifact_path"] = DEFAULT_ARTIFACT_PATH
+    if "match_table_path" not in st.session_state:
+        st.session_state["match_table_path"] = DEFAULT_MATCH_TABLE_PATH
+    if "metrics_path" not in st.session_state:
+        st.session_state["metrics_path"] = DEFAULT_METRICS_PATH
+    if "journal_path" not in st.session_state:
+        st.session_state["journal_path"] = DEFAULT_JOURNAL_PATH
+    if "include_explanation" not in st.session_state:
+        st.session_state["include_explanation"] = True
+
+    usage = get_usage_snapshot()
+    with st.sidebar:
+        st.metric("Free predictions left", usage["remaining"])
+        st.caption(f"Used {usage['used']} / {usage['allowance']} in {usage['month']}")
+
+        with st.expander("Runtime Settings", expanded=False):
+            st.text_input("Model artifact", key="artifact_path")
+            st.text_input("Match table", key="match_table_path")
+            st.text_input("Metrics file", key="metrics_path")
+            st.text_input("Journal file", key="journal_path")
+            st.checkbox("Include SHAP explanation", key="include_explanation")
 
     return {
-        "leagues": unique_values(["league"]),
-        "patches": unique_values(["patch"]),
-        "splits": unique_values(["split"]),
-        "team_names": unique_values(["blue_team_name", "red_team_name"]),
-        "team_ids": unique_values(["blue_team_id", "red_team_id"]),
-        "champions": sorted({c for c in champions if c}),
-        "duration_median": float(duration_series.median()) if not duration_series.empty else 1900.0,
-        "ckpm_median": float(ckpm_values.median()) if not ckpm_values.empty else 0.7,
+        "artifact_path": str(st.session_state["artifact_path"]),
+        "match_table_path": str(st.session_state["match_table_path"]),
+        "metrics_path": str(st.session_state["metrics_path"]),
+        "journal_path": str(st.session_state["journal_path"]),
+        "include_explanation": bool(st.session_state["include_explanation"]),
     }
 
 
-def _team_history_view(match_df: pd.DataFrame) -> pd.DataFrame:
-    if match_df.empty:
-        return pd.DataFrame()
-
-    blue = pd.DataFrame(
-        {
-            "date": match_df.get("date"),
-            "team_id": match_df.get("blue_team_id"),
-            "team_name": match_df.get("blue_team_name"),
-            "rolling_duration_prior_seconds": match_df.get("blue_rolling_duration_prior_seconds"),
-            "rolling_ckpm_prior": match_df.get("blue_rolling_ckpm_prior"),
-        }
-    )
-    red = pd.DataFrame(
-        {
-            "date": match_df.get("date"),
-            "team_id": match_df.get("red_team_id"),
-            "team_name": match_df.get("red_team_name"),
-            "rolling_duration_prior_seconds": match_df.get("red_rolling_duration_prior_seconds"),
-            "rolling_ckpm_prior": match_df.get("red_rolling_ckpm_prior"),
-        }
-    )
-    out = pd.concat([blue, red], axis=0, ignore_index=True)
-    out["team_id_norm"] = out["team_id"].map(_normalize_team_id)
-    out["team_name_norm"] = out["team_name"].map(lambda x: _clean_text(x).lower())
-    out = out.sort_values("date")
-    return out
+def _set_nav(page: str) -> None:
+    st.session_state["nav_page"] = page
+    st.rerun()
 
 
-def _recent_template_rows(match_df: pd.DataFrame, max_rows: int = 300) -> pd.DataFrame:
-    if match_df.empty:
-        return pd.DataFrame()
-    view = match_df.sort_values("date", ascending=False).head(max_rows).copy()
-    view["template_label"] = (
-        view["date"].dt.strftime("%Y-%m-%d")
-        + " | "
-        + view["league"].astype(str)
-        + " | "
-        + view["blue_team_name"].astype(str)
-        + " vs "
-        + view["red_team_name"].astype(str)
-        + " | patch "
-        + view["patch"].astype(str)
-    )
-    return view
+def _home_cta_buttons() -> None:
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Generate Prediction", use_container_width=True):
+        _set_nav("Predictions")
+    if c2.button("View Calendar", use_container_width=True):
+        _set_nav("Calendar")
+    if c3.button("Open Journal", use_container_width=True):
+        _set_nav("Journal")
 
+def _render_home_page(ctx: AppContext) -> None:
+    usage = get_usage_snapshot()
+    primary_model = "Unavailable"
+    if ctx.artifacts:
+        primary_model = str(ctx.artifacts.get("primary_model", "model")).upper()
 
-def _lookup_team_priors(
-    team_history: pd.DataFrame,
-    team_id: str,
-    team_name: str,
-) -> Tuple[Optional[float], Optional[float]]:
-    if team_history.empty:
-        return None, None
+    mae = ctx.test_mae_minutes if ctx.test_mae_minutes is not None else _resolve_primary_metric(ctx.metrics_payload, "mae_minutes")
+    rmse = _resolve_primary_metric(ctx.metrics_payload, "rmse_minutes")
+    within5 = _resolve_primary_metric(ctx.metrics_payload, "within_5_minutes_accuracy")
 
-    subset = pd.DataFrame()
-    normalized_id = _normalize_team_id(team_id)
-    normalized_name = _clean_text(team_name).lower()
-
-    if normalized_id:
-        subset = team_history[team_history["team_id_norm"] == normalized_id]
-    if subset.empty and normalized_name:
-        subset = team_history[team_history["team_name_norm"] == normalized_name]
-    if subset.empty:
-        return None, None
-
-    last_row = subset.iloc[-1]
-    duration = pd.to_numeric(last_row["rolling_duration_prior_seconds"], errors="coerce")
-    ckpm = pd.to_numeric(last_row["rolling_ckpm_prior"], errors="coerce")
-
-    duration_out = float(duration) if pd.notna(duration) else None
-    ckpm_out = float(ckpm) if pd.notna(ckpm) else None
-    return duration_out, ckpm_out
-
-
-def _apply_template_to_defaults(
-    template_row: pd.Series,
-    defaults: Dict[str, Any],
-) -> Dict[str, Any]:
-    out = defaults.copy()
-    out["league"] = _clean_text(template_row.get("league")) or out["league"]
-    out["patch"] = _clean_text(template_row.get("patch")) or out["patch"]
-    out["split"] = _clean_text(template_row.get("split")) or out["split"]
-
-    template_year = pd.to_numeric(template_row.get("year"), errors="coerce")
-    if pd.notna(template_year):
-        out["year"] = int(template_year)
-
-    playoffs = pd.to_numeric(template_row.get("playoffs"), errors="coerce")
-    if pd.notna(playoffs):
-        out["playoffs"] = bool(int(playoffs))
-
-    blue_first_pick = pd.to_numeric(template_row.get("blue_first_pick"), errors="coerce")
-    if pd.notna(blue_first_pick):
-        out["blue_first_pick"] = bool(int(blue_first_pick))
-
-    out["blue_team_name"] = _clean_text(template_row.get("blue_team_name")) or out["blue_team_name"]
-    out["red_team_name"] = _clean_text(template_row.get("red_team_name")) or out["red_team_name"]
-    out["blue_team_id"] = _clean_text(template_row.get("blue_team_id")) or out["blue_team_id"]
-    out["red_team_id"] = _clean_text(template_row.get("red_team_id")) or out["red_team_id"]
-
-    for role in ROLE_ORDER:
-        out[f"blue_role_{role}"] = _clean_text(template_row.get(f"blue_{role}_champion")) or out[f"blue_role_{role}"]
-        out[f"red_role_{role}"] = _clean_text(template_row.get(f"red_{role}_champion")) or out[f"red_role_{role}"]
-
-    for idx in range(1, 6):
-        out[f"blue_pick_{idx}"] = _clean_text(template_row.get(f"blue_pick{idx}"))
-        out[f"red_pick_{idx}"] = _clean_text(template_row.get(f"red_pick{idx}"))
-        out[f"blue_ban_{idx}"] = _clean_text(template_row.get(f"blue_ban{idx}"))
-        out[f"red_ban_{idx}"] = _clean_text(template_row.get(f"red_ban{idx}"))
-
-    blue_dur = pd.to_numeric(template_row.get("blue_rolling_duration_prior_seconds"), errors="coerce")
-    red_dur = pd.to_numeric(template_row.get("red_rolling_duration_prior_seconds"), errors="coerce")
-    blue_ckpm = pd.to_numeric(template_row.get("blue_rolling_ckpm_prior"), errors="coerce")
-    red_ckpm = pd.to_numeric(template_row.get("red_rolling_ckpm_prior"), errors="coerce")
-    if pd.notna(blue_dur):
-        out["blue_duration_prior"] = float(blue_dur)
-    if pd.notna(red_dur):
-        out["red_duration_prior"] = float(red_dur)
-    if pd.notna(blue_ckpm):
-        out["blue_ckpm_prior"] = float(blue_ckpm)
-    if pd.notna(red_ckpm):
-        out["red_ckpm_prior"] = float(red_ckpm)
-
-    return out
-
-
-def _parse_role_quick_input(raw_text: str) -> Optional[List[str]]:
-    tokens = [token.strip() for token in raw_text.split(",") if token.strip()]
-    if len(tokens) != 5:
-        return None
-    return tokens
-
-
-def _default_form_state(options: Dict[str, Any], default_year: int) -> Dict[str, Any]:
-    first = lambda values: values[0] if values else ""
-    defaults: Dict[str, Any] = {
-        "league": first(options["leagues"]),
-        "patch": first(options["patches"]),
-        "split": first(options["splits"]),
-        "year": int(default_year),
-        "playoffs": False,
-        "blue_first_pick": True,
-        "blue_team_name": first(options["team_names"]),
-        "red_team_name": first(options["team_names"]),
-        "blue_team_name_custom": "",
-        "red_team_name_custom": "",
-        "blue_team_id": first(options["team_ids"]),
-        "red_team_id": first(options["team_ids"]),
-        "blue_team_id_custom": "",
-        "red_team_id_custom": "",
-        "blue_duration_prior": float(options["duration_median"]),
-        "red_duration_prior": float(options["duration_median"]),
-        "blue_ckpm_prior": float(options["ckpm_median"]),
-        "red_ckpm_prior": float(options["ckpm_median"]),
-        "blue_roles_quick": "",
-        "red_roles_quick": "",
-    }
-    for role in ROLE_ORDER:
-        defaults[f"blue_role_{role}"] = ""
-        defaults[f"red_role_{role}"] = ""
-    for idx in range(1, 6):
-        defaults[f"blue_pick_{idx}"] = ""
-        defaults[f"red_pick_{idx}"] = ""
-        defaults[f"blue_ban_{idx}"] = ""
-        defaults[f"red_ban_{idx}"] = ""
-    return defaults
-
-
-def _swap_form_sides() -> None:
-    pairs = [
-        ("blue_team_name", "red_team_name"),
-        ("blue_team_name_custom", "red_team_name_custom"),
-        ("blue_team_id", "red_team_id"),
-        ("blue_team_id_custom", "red_team_id_custom"),
-        ("blue_duration_prior", "red_duration_prior"),
-        ("blue_ckpm_prior", "red_ckpm_prior"),
-        ("blue_roles_quick", "red_roles_quick"),
-    ]
-    for role in ROLE_ORDER:
-        pairs.append((f"blue_role_{role}", f"red_role_{role}"))
-    for idx in range(1, 6):
-        pairs.append((f"blue_pick_{idx}", f"red_pick_{idx}"))
-        pairs.append((f"blue_ban_{idx}", f"red_ban_{idx}"))
-
-    for left, right in pairs:
-        st.session_state[left], st.session_state[right] = st.session_state.get(right, ""), st.session_state.get(left, "")
-    st.session_state["blue_first_pick"] = not bool(st.session_state.get("blue_first_pick", True))
-
-
-def _build_payload(form_data: Dict[str, Any]) -> Dict[str, Any]:
-    blue_roles = form_data["blue_roles"]
-    red_roles = form_data["red_roles"]
-
-    def fallback_pick(raw_pick: str, role_name: str, role_map: Dict[str, str]) -> Optional[str]:
-        value = _clean_text(raw_pick)
-        if value:
-            return value
-        role_value = _clean_text(role_map.get(role_name))
-        return role_value or None
-
-    blue_picks = [
-        fallback_pick(form_data["blue_picks"][idx], ROLE_ORDER[idx], blue_roles)
-        for idx in range(5)
-    ]
-    red_picks = [
-        fallback_pick(form_data["red_picks"][idx], ROLE_ORDER[idx], red_roles)
-        for idx in range(5)
-    ]
-
-    blue_bans = [_clean_text(v) or None for v in form_data["blue_bans"]]
-    red_bans = [_clean_text(v) or None for v in form_data["red_bans"]]
-
-    blue_champions = [c for c in [_clean_text(blue_roles[r]) for r in ROLE_ORDER] if c]
-    red_champions = [c for c in [_clean_text(red_roles[r]) for r in ROLE_ORDER] if c]
-
-    if len(blue_champions) < 5:
-        blue_champions = [c for c in blue_picks if _clean_text(c)]
-    if len(red_champions) < 5:
-        red_champions = [c for c in red_picks if _clean_text(c)]
-
-    payload = {
-        "league": _clean_text(form_data["league"]),
-        "split": _clean_text(form_data["split"]),
-        "patch": _clean_text(form_data["patch"]),
-        "year": int(form_data["year"]),
-        "playoffs": int(form_data["playoffs"]),
-        "blue_team_id": _clean_text(form_data["blue_team_id"]) or None,
-        "red_team_id": _clean_text(form_data["red_team_id"]) or None,
-        "blue_team_name": _clean_text(form_data["blue_team_name"]) or None,
-        "red_team_name": _clean_text(form_data["red_team_name"]) or None,
-        "blue_first_pick": int(form_data["blue_first_pick"]),
-        "red_first_pick": int(1 - form_data["blue_first_pick"]),
-        "blue_rolling_duration_prior_seconds": float(form_data["blue_duration_prior"]),
-        "red_rolling_duration_prior_seconds": float(form_data["red_duration_prior"]),
-        "rolling_duration_prior_diff_seconds": float(
-            form_data["blue_duration_prior"] - form_data["red_duration_prior"]
-        ),
-        "blue_rolling_ckpm_prior": float(form_data["blue_ckpm_prior"]),
-        "red_rolling_ckpm_prior": float(form_data["red_ckpm_prior"]),
-        "rolling_ckpm_prior_diff": float(form_data["blue_ckpm_prior"] - form_data["red_ckpm_prior"]),
-        "blue_draft_champions": blue_champions,
-        "red_draft_champions": red_champions,
-    }
-
-    for role in ROLE_ORDER:
-        payload[f"blue_{role}_champion"] = _clean_text(blue_roles.get(role)) or None
-        payload[f"red_{role}_champion"] = _clean_text(red_roles.get(role)) or None
-
-    for idx in range(5):
-        payload[f"blue_pick{idx + 1}"] = blue_picks[idx]
-        payload[f"red_pick{idx + 1}"] = red_picks[idx]
-        payload[f"blue_ban{idx + 1}"] = blue_bans[idx]
-        payload[f"red_ban{idx + 1}"] = red_bans[idx]
-
-    return payload
-
-
-def _validate_draft_inputs(blue_roles: Dict[str, str], red_roles: Dict[str, str]) -> List[str]:
-    errors: List[str] = []
-    blue_list = [_clean_text(blue_roles.get(role, "")) for role in ROLE_ORDER]
-    red_list = [_clean_text(red_roles.get(role, "")) for role in ROLE_ORDER]
-
-    if any(not champ for champ in blue_list):
-        errors.append("Blue side needs all 5 role champions.")
-    if any(not champ for champ in red_list):
-        errors.append("Red side needs all 5 role champions.")
-
-    if len([c for c in blue_list if c]) == 5 and len(set(blue_list)) != 5:
-        errors.append("Blue side has duplicate champions.")
-    if len([c for c in red_list if c]) == 5 and len(set(red_list)) != 5:
-        errors.append("Red side has duplicate champions.")
-
-    overlap = set([c for c in blue_list if c]).intersection(set([c for c in red_list if c]))
-    if overlap:
-        errors.append("Champion overlap across teams: " + ", ".join(sorted(overlap)))
-
-    return errors
-
-
-def _inject_styles() -> None:
     st.markdown(
-        """
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap');
-        html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; color: #0f172a; }
-        .stApp {
-            background:
-                radial-gradient(circle at 8% 12%, rgba(244, 167, 0, 0.20), transparent 40%),
-                radial-gradient(circle at 96% 2%, rgba(30, 136, 229, 0.16), transparent 44%),
-                linear-gradient(180deg, #f8fafc 0%, #eef4fb 100%);
-        }
-        .block-container { padding-top: 1.2rem; padding-bottom: 1.4rem; max-width: 1220px; }
-        .hero {
-            border: 1px solid rgba(15, 23, 42, 0.15);
-            background: linear-gradient(135deg, rgba(255,255,255,0.96), rgba(255,255,255,0.82));
-            border-radius: 20px;
-            padding: 1.05rem 1.2rem;
-            margin-bottom: 1rem;
-            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.06);
-        }
-        .section-card {
-            border-radius: 16px;
-            border: 1px solid rgba(15, 23, 42, 0.13);
-            background: rgba(255, 255, 255, 0.88);
-            padding: 0.8rem 1rem;
-            margin-bottom: 0.75rem;
-        }
-        </style>
+        f"""
+        <div class="hero-shell">
+            <div class="subtle-label">Esports Prediction Platform</div>
+            <h1 style="margin:0.1rem 0 0.4rem 0;">MinuteModel</h1>
+            <p style="margin:0 0 0.6rem 0; max-width:860px;">
+            Draft-aware match predictions designed for fast decision making. Generate pre-game estimates in seconds,
+            track outcomes in your journal, and monitor model quality over time.
+            </p>
+            <span class="badge">League of Legends: Live</span>
+            <span class="badge">CS2: Frontend Ready</span>
+            <span class="badge">Dota 2: Planned</span>
+            <span class="badge">VALORANT: Planned</span>
+            <span class="badge">Free predictions left: {usage['remaining']}</span>
+        </div>
         """,
         unsafe_allow_html=True,
     )
+    _home_cta_buttons()
 
-
-def main() -> None:
-    st.set_page_config(
-        page_title="MinuteModel Predictor",
-        page_icon=":hourglass_flowing_sand:",
-        layout="wide",
-    )
-    _inject_styles()
-
-    st.markdown(
+    st.markdown("### How It Works")
+    h1, h2, h3 = st.columns(3)
+    h1.markdown(
         """
-        <div class="hero">
-        <div style="font-size:0.8rem; text-transform:uppercase; letter-spacing:0.08em; color:#1d4ed8; font-weight:700;">Draft-Only Predictor</div>
-        <h2 style="margin:0.1rem 0 0 0;">MinuteModel Match Duration Predictor</h2>
-        <p style="margin:0.4rem 0 0 0;">
-        Build a clean pre-game draft context and get a fast duration estimate for upcoming pro LoL matches.
-        </p>
+        <div class="app-card">
+            <b>1) Select Match Context</b><br/>
+            Choose game, league, patch, teams, and draft details.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    h2.markdown(
+        """
+        <div class="app-card">
+            <b>2) Generate Prediction</b><br/>
+            The model estimates expected match duration using pre-game information only.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    h3.markdown(
+        """
+        <div class="app-card">
+            <b>3) Track Outcomes</b><br/>
+            Save predictions to the journal and evaluate long-term performance.
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    with st.sidebar:
-        st.subheader("Model Files")
-        artifact_path = st.text_input(
-            "Artifact path",
-            value="artifacts/model_artifacts.joblib",
+    st.markdown("### Model Snapshot")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Primary model", primary_model)
+    m2.metric("MAE (minutes)", f"{mae:.2f}" if mae is not None else "N/A")
+    m3.metric("RMSE (minutes)", f"{rmse:.2f}" if rmse is not None else "N/A")
+    m4.metric("Within 5 min", f"{within5 * 100:.1f}%" if within5 is not None else "N/A")
+
+    st.markdown("### Supported Games")
+    games = pd.DataFrame(
+        [
+            {"Game": "League of Legends", "Status": "Active", "Available prediction": "Draft-only match duration"},
+            {"Game": "Counter-Strike 2", "Status": "UI ready", "Available prediction": "Connect your CS2 backend"},
+            {"Game": "Dota 2", "Status": "Planned", "Available prediction": "Coming soon"},
+            {"Game": "VALORANT", "Status": "Planned", "Available prediction": "Coming soon"},
+        ]
+    )
+    st.dataframe(games, use_container_width=True, hide_index=True)
+
+    st.markdown("### Trust and Methodology")
+    st.info(
+        "Predictions on this app are pre-game only. The model never uses in-game or post-game stats for this view, "
+        "so outputs are a draft benchmark rather than a live-state oracle."
+    )
+    st.markdown(
+        """
+        - Chronological validation is used to mimic future match forecasting.
+        - Results are benchmarked against simple baselines for transparency.
+        - Explanations are model-behavior diagnostics, not causal claims.
+        """
+    )
+
+
+def _auto_fill_priors(ctx: AppContext) -> None:
+    blue_team_name = clean_text(st.session_state.get("blue_team_name_custom")) or clean_text(
+        st.session_state.get("blue_team_name")
+    )
+    red_team_name = clean_text(st.session_state.get("red_team_name_custom")) or clean_text(
+        st.session_state.get("red_team_name")
+    )
+    blue_team_id = clean_text(st.session_state.get("blue_team_id_custom")) or clean_text(
+        st.session_state.get("blue_team_id")
+    )
+    red_team_id = clean_text(st.session_state.get("red_team_id_custom")) or clean_text(
+        st.session_state.get("red_team_id")
+    )
+
+    blue_duration, blue_ckpm = lookup_team_priors(ctx.team_history, blue_team_id, blue_team_name)
+    red_duration, red_ckpm = lookup_team_priors(ctx.team_history, red_team_id, red_team_name)
+
+    if blue_duration is not None:
+        st.session_state["blue_duration_prior"] = float(blue_duration)
+    if red_duration is not None:
+        st.session_state["red_duration_prior"] = float(red_duration)
+    if blue_ckpm is not None:
+        st.session_state["blue_ckpm_prior"] = float(blue_ckpm)
+    if red_ckpm is not None:
+        st.session_state["red_ckpm_prior"] = float(red_ckpm)
+
+
+def _apply_template_selection(ctx: AppContext, defaults: Dict[str, Any], template_label: str) -> None:
+    if ctx.template_rows.empty or not template_label:
+        return
+    selected = ctx.template_rows[ctx.template_rows["template_label"] == template_label]
+    if selected.empty:
+        return
+    updated = apply_template_to_defaults(selected.iloc[0], defaults)
+    for key, value in updated.items():
+        st.session_state[key] = value
+
+
+def _consume_calendar_prefill(ctx: AppContext, defaults: Dict[str, Any]) -> None:
+    prefill_gameid = st.session_state.get("selected_template_gameid")
+    if prefill_gameid is None or ctx.template_rows.empty:
+        return
+    selected = ctx.template_rows[ctx.template_rows["gameid"].astype(str) == str(prefill_gameid)]
+    if selected.empty:
+        st.session_state["selected_template_gameid"] = None
+        return
+    updated = apply_template_to_defaults(selected.iloc[0], defaults)
+    for key, value in updated.items():
+        st.session_state[key] = value
+    st.session_state["selected_template_gameid"] = None
+    st.success("Loaded selected calendar match into the prediction form.")
+
+def _prediction_result_card(ctx: AppContext, result: Dict[str, Any]) -> None:
+    pred_minutes = _safe_float(result.get("predicted_duration_minutes"), 0.0)
+    pred_seconds = _safe_float(result.get("predicted_duration_seconds"), 0.0)
+    mae_minutes = _safe_float(result.get("mae_context_minutes"), 4.2)
+    rmse_minutes = _safe_float(result.get("rmse_context_minutes"), max(mae_minutes * 1.3, 1.8))
+    line_minutes = _safe_float(result.get("market_line_minutes"), 0.0)
+
+    lower = max(pred_minutes - mae_minutes, 0.0)
+    upper = pred_minutes + mae_minutes
+
+    confidence_label = "Directional"
+    confidence_detail = "No market line selected."
+    p_over = None
+    p_under = None
+    edge_pct = None
+
+    if line_minutes > 0:
+        z = (pred_minutes - line_minutes) / max(rmse_minutes, 1e-6)
+        p_over = float(_normal_cdf(z))
+        p_under = float(1.0 - p_over)
+        edge_pct = float(abs(max(p_over, p_under) - 0.5) * 100.0)
+        if edge_pct >= 15:
+            confidence_label = "High"
+        elif edge_pct >= 8:
+            confidence_label = "Medium"
+        else:
+            confidence_label = "Low"
+        confidence_detail = (
+            f"Over {line_minutes:.1f}m: {p_over * 100:.1f}% | "
+            f"Under {line_minutes:.1f}m: {p_under * 100:.1f}%"
         )
-        match_table_path = st.text_input(
-            "Match table path",
-            value="artifacts/match_level_table.csv",
+
+    timestamp = result.get("prediction_timestamp_utc", pd.Timestamp.now(tz="UTC").isoformat())
+    st.markdown(
+        f"""
+        <div class="app-card">
+            <div class="subtle-label">Prediction Result</div>
+            <h3 style="margin-top:0.15rem;">Expected Match Duration: {pred_minutes:.2f} minutes</h3>
+            <p style="margin:0.15rem 0;">
+                Estimated practical range: <b>{lower:.1f} to {upper:.1f} minutes</b> (based on historical MAE).
+            </p>
+            <p style="margin:0.15rem 0;">Timestamp (UTC): {timestamp}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Predicted duration", f"{pred_minutes:.2f} min")
+    k2.metric("Clock estimate", _clock_from_seconds(pred_seconds))
+    k3.metric("Confidence", confidence_label)
+    k4.metric("Free predictions left", get_usage_snapshot()["remaining"])
+
+    if line_minutes > 0 and p_over is not None and p_under is not None:
+        st.info(
+            f"{confidence_detail}. Estimated edge: {edge_pct:.1f}%."
         )
-        metrics_path = st.text_input(
-            "Metrics summary path",
-            value="reports/metrics_summary.json",
-        )
-        include_explanation = st.checkbox("Include SHAP explanation", value=True)
-
-    artifact_file = Path(artifact_path)
-    if not artifact_file.exists():
-        st.error(f"Artifact file not found: {artifact_file}")
-        st.stop()
-
-    try:
-        artifacts = _load_artifacts_cached(str(artifact_file))
-    except Exception as exc:
-        st.error(f"Failed to load artifacts: {exc}")
-        st.stop()
-
-    config = artifacts.get("config", {})
-    match_df = _load_match_table(str(match_table_path))
-    options = _extract_ui_options(match_df)
-    team_history = _team_history_view(match_df)
-    test_mae_minutes = _load_test_mae_minutes(metrics_path)
-
-    default_year = int(pd.Timestamp.now(tz="UTC").year)
-    if not match_df.empty and "date" in match_df.columns and match_df["date"].notna().any():
-        default_year = int(match_df["date"].dropna().max().year)
-
-    defaults = _default_form_state(options, default_year=default_year)
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-    template_rows = _recent_template_rows(match_df)
-
-    with st.sidebar:
-        st.markdown("---")
         st.caption(
-            "Model config: "
-            f"role_specific={config.get('use_role_specific_draft_features', True)} | "
-            f"bag_fallback={config.get('use_bag_of_champions_fallback', True)} | "
-            f"target_unit={config.get('target_unit', 'seconds')}"
+            "Probability uses a normal error approximation around model RMSE and should be treated as directional."
         )
-        if test_mae_minutes is not None:
-            st.caption(f"Historical test MAE: {test_mae_minutes:.2f} min")
+    else:
+        st.caption("Add an optional market line to estimate over/under probability and edge.")
 
-        if not template_rows.empty:
-            selected_template_label = st.selectbox(
-                "Prefill from recent match",
-                options=template_rows["template_label"].tolist(),
-                index=0,
-            )
-            col_t1, col_t2 = st.columns(2)
-            if col_t1.button("Load Template", use_container_width=True):
-                row = template_rows[template_rows["template_label"] == selected_template_label].iloc[0]
-                updated = _apply_template_to_defaults(row, defaults)
-                for key, value in updated.items():
-                    st.session_state[key] = value
-                st.rerun()
-            if col_t2.button("Swap Sides", use_container_width=True):
-                _swap_form_sides()
-                st.rerun()
+    explanation = result.get("explanation")
+    if explanation:
+        if explanation.get("warning"):
+            st.warning(str(explanation["warning"]))
+        top_features = explanation.get("top_feature_contributions", [])
+        if top_features:
+            top_df = pd.DataFrame(top_features)
+            if "shap_value" in top_df.columns:
+                top_df["impact"] = np.where(top_df["shap_value"] >= 0, "Longer", "Shorter")
+                top_df["abs_shap"] = top_df["shap_value"].abs()
+                top_df = top_df.sort_values("abs_shap", ascending=False)
+                top_df["shap_value"] = top_df["shap_value"].round(4)
+            st.markdown("#### Key Supporting Factors")
+            cols = [c for c in ["feature", "impact", "shap_value"] if c in top_df.columns]
+            st.dataframe(top_df[cols], use_container_width=True, hide_index=True)
 
-        if st.button("Reset Form", use_container_width=True):
+    with st.expander("Inference payload"):
+        st.json(result.get("payload", {}))
+
+    with st.expander("Save to Journal"):
+        prediction_id = str(result.get("prediction_id"))
+        already_saved = st.session_state.get("last_saved_prediction_id") == prediction_id
+        j1, j2, j3 = st.columns(3)
+        status = j1.selectbox(
+            "Outcome status",
+            ["Pending", "Won", "Lost", "Push"],
+            index=0,
+            key=f"journal_status_{prediction_id}",
+        )
+        odds = j2.number_input(
+            "Decimal odds",
+            min_value=1.01,
+            value=1.90,
+            step=0.01,
+            key=f"journal_odds_{prediction_id}",
+        )
+        stake = j3.number_input(
+            "Stake (units)",
+            min_value=0.1,
+            value=1.0,
+            step=0.1,
+            key=f"journal_stake_{prediction_id}",
+        )
+        notes = st.text_area(
+            "Notes",
+            key=f"journal_notes_{prediction_id}",
+            placeholder="Context, line movement, or reasoning...",
+        )
+        if st.button("Add to Journal", use_container_width=True, disabled=already_saved, key=f"save_{prediction_id}"):
+            entry = {
+                "entry_id": prediction_id,
+                "created_at_utc": result.get("prediction_timestamp_utc"),
+                "game": result.get("game", "League of Legends"),
+                "league": result.get("league", ""),
+                "match_label": result.get("match_label", ""),
+                "prediction_type": "Match Duration (minutes)",
+                "predicted_value": pred_minutes,
+                "confidence_label": confidence_label,
+                "model_name": result.get("model_name", ""),
+                "status": status,
+                "odds_decimal": float(odds),
+                "stake_units": float(stake),
+                "profit_units": np.nan,
+                "notes": notes,
+            }
+            append_journal_entry(ctx.journal_path, entry)
+            st.session_state["last_saved_prediction_id"] = prediction_id
+            st.success("Prediction saved to journal.")
+
+
+def _render_predictions_page(ctx: AppContext) -> None:
+    st.markdown("## Predictions")
+    st.caption("Build pre-game inputs, generate a forecast, and optionally log it in your journal.")
+
+    if ctx.artifact_error:
+        st.error(ctx.artifact_error)
+        st.info("Update the model artifact path in the sidebar to enable predictions.")
+        return
+
+    defaults = default_form_state(ctx.options, default_year=_default_year_from_table(ctx.match_df))
+    if "market_line_minutes" not in st.session_state:
+        st.session_state["market_line_minutes"] = 0.0
+    ensure_form_state(defaults)
+    _consume_calendar_prefill(ctx, defaults)
+
+    template_labels = []
+    if not ctx.template_rows.empty:
+        template_labels = [""] + ctx.template_rows["template_label"].tolist()
+
+    with st.container(border=True):
+        st.markdown("### Draft Setup")
+        c1, c2 = st.columns(2)
+        selected_template_label = c1.selectbox(
+            "Start from recent match template",
+            template_labels,
+            index=0,
+            help="Loads known teams and draft context as a starting point.",
+        )
+        c2.caption("Use template + adjust manually for upcoming matches.")
+        b1, b2, b3, b4 = st.columns(4)
+        if b1.button("Load Template", use_container_width=True, disabled=not bool(selected_template_label)):
+            _apply_template_selection(ctx, defaults, selected_template_label)
+            st.rerun()
+        if b2.button("Swap Blue/Red", use_container_width=True):
+            swap_form_sides()
+            st.rerun()
+        if b3.button("Auto-fill Priors", use_container_width=True, disabled=ctx.team_history.empty):
+            _auto_fill_priors(ctx)
+            st.rerun()
+        if b4.button("Reset Form", use_container_width=True):
             for key, value in defaults.items():
                 st.session_state[key] = value
+            st.session_state["market_line_minutes"] = 0.0
             st.rerun()
 
     filled_roles = sum(
-        bool(_clean_text(st.session_state.get(f"{side}_role_{role}", "")))
+        bool(clean_text(st.session_state.get(f"{side}_role_{role}", "")))
         for side in ["blue", "red"]
         for role in ROLE_ORDER
     )
     st.progress(filled_roles / 10.0, text=f"Draft completion: {filled_roles}/10 champions")
 
-    with st.form("prediction_form"):
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown("### 1) Match Metadata")
-        meta_col1, meta_col2, meta_col3, meta_col4 = st.columns(4)
+    champ_options = ctx.options.get("champions", [])
+    if not champ_options:
+        champ_options = ["Aatrox", "Lee Sin", "Orianna", "Jinx", "Nautilus"]
 
-        league = meta_col1.selectbox(
-            "League",
-            options=_options_with_current(options["leagues"], st.session_state.get("league", "")),
+    with st.form("prediction_form", clear_on_submit=False):
+        st.markdown("### Match Context")
+        m1, m2 = st.columns(2)
+        game_choice = m1.selectbox("Game", SUPPORTED_GAMES, key="game")
+        league = m2.selectbox(
+            "Region / League",
+            options_with_current(ctx.options["leagues"], st.session_state.get("league", "")),
             key="league",
         )
-        patch = meta_col2.selectbox(
+        m3, m4, m5, m6 = st.columns(4)
+        patch = m3.selectbox(
             "Patch",
-            options=_options_with_current(options["patches"], st.session_state.get("patch", "")),
+            options_with_current(ctx.options["patches"], st.session_state.get("patch", "")),
             key="patch",
         )
-        split = meta_col3.selectbox(
+        split = m4.selectbox(
             "Split",
-            options=_options_with_current(options["splits"], st.session_state.get("split", "")),
+            options_with_current(ctx.options["splits"], st.session_state.get("split", "")),
             key="split",
         )
-        year = meta_col4.number_input(
-            "Year",
-            min_value=2020,
-            max_value=2035,
-            step=1,
-            key="year",
-        )
-        playoffs = st.toggle("Playoffs match", key="playoffs")
+        year = m5.number_input("Year", min_value=2020, max_value=2035, step=1, key="year")
+        playoffs = m6.toggle("Playoffs", key="playoffs")
         blue_first_pick = st.toggle("Blue side has first pick", key="blue_first_pick")
-        st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown("### 2) Teams")
-        team_col1, team_col2 = st.columns(2)
-        with team_col1:
-            st.markdown("#### Blue Side")
-            blue_team_name = st.selectbox(
-                "Blue team name",
-                options=_options_with_current(options["team_names"], st.session_state.get("blue_team_name", "")),
-                key="blue_team_name",
-            )
-            blue_team_name_custom = st.text_input("Blue team name override (optional)", key="blue_team_name_custom")
-            blue_team_id = st.selectbox(
-                "Blue team ID",
-                options=_options_with_current(options["team_ids"], st.session_state.get("blue_team_id", "")),
-                key="blue_team_id",
-            )
-            blue_team_id_custom = st.text_input("Blue team ID override (optional)", key="blue_team_id_custom")
+        st.markdown("### Teams")
+        t1, t2 = st.columns(2)
+        blue_team_name = t1.selectbox(
+            "Blue team name",
+            options_with_current(ctx.options["team_names"], st.session_state.get("blue_team_name", "")),
+            key="blue_team_name",
+        )
+        red_team_name = t2.selectbox(
+            "Red team name",
+            options_with_current(ctx.options["team_names"], st.session_state.get("red_team_name", "")),
+            key="red_team_name",
+        )
+        t3, t4 = st.columns(2)
+        blue_team_name_custom = t3.text_input("Blue team name override", key="blue_team_name_custom")
+        red_team_name_custom = t4.text_input("Red team name override", key="red_team_name_custom")
+        t5, t6 = st.columns(2)
+        blue_team_id = t5.selectbox(
+            "Blue team ID",
+            options_with_current(ctx.options["team_ids"], st.session_state.get("blue_team_id", "")),
+            key="blue_team_id",
+        )
+        red_team_id = t6.selectbox(
+            "Red team ID",
+            options_with_current(ctx.options["team_ids"], st.session_state.get("red_team_id", "")),
+            key="red_team_id",
+        )
+        t7, t8 = st.columns(2)
+        blue_team_id_custom = t7.text_input("Blue team ID override", key="blue_team_id_custom")
+        red_team_id_custom = t8.text_input("Red team ID override", key="red_team_id_custom")
 
-        with team_col2:
-            st.markdown("#### Red Side")
-            red_team_name = st.selectbox(
-                "Red team name",
-                options=_options_with_current(options["team_names"], st.session_state.get("red_team_name", "")),
-                key="red_team_name",
-            )
-            red_team_name_custom = st.text_input("Red team name override (optional)", key="red_team_name_custom")
-            red_team_id = st.selectbox(
-                "Red team ID",
-                options=_options_with_current(options["team_ids"], st.session_state.get("red_team_id", "")),
-                key="red_team_id",
-            )
-            red_team_id_custom = st.text_input("Red team ID override (optional)", key="red_team_id_custom")
+        st.markdown("### Historical Priors")
+        p1, p2 = st.columns(2)
+        blue_duration_prior = p1.number_input(
+            "Blue rolling duration prior (seconds)",
+            min_value=300.0,
+            step=10.0,
+            key="blue_duration_prior",
+        )
+        red_duration_prior = p2.number_input(
+            "Red rolling duration prior (seconds)",
+            min_value=300.0,
+            step=10.0,
+            key="red_duration_prior",
+        )
+        p3, p4 = st.columns(2)
+        blue_ckpm_prior = p3.number_input(
+            "Blue rolling CKPM prior",
+            min_value=0.1,
+            step=0.01,
+            key="blue_ckpm_prior",
+        )
+        red_ckpm_prior = p4.number_input(
+            "Red rolling CKPM prior",
+            min_value=0.1,
+            step=0.01,
+            key="red_ckpm_prior",
+        )
 
-        blue_team_name_final = _clean_text(blue_team_name_custom) or _clean_text(blue_team_name)
-        red_team_name_final = _clean_text(red_team_name_custom) or _clean_text(red_team_name)
-        blue_team_id_final = _clean_text(blue_team_id_custom) or _clean_text(blue_team_id)
-        red_team_id_final = _clean_text(red_team_id_custom) or _clean_text(red_team_id)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown("### 3) Historical Priors")
-        auto_fill_priors = st.checkbox("Auto-fill priors from latest team history", value=True)
-
-        if auto_fill_priors and not team_history.empty:
-            blue_duration_auto, blue_ckpm_auto = _lookup_team_priors(
-                team_history,
-                team_id=blue_team_id_final,
-                team_name=blue_team_name_final,
-            )
-            red_duration_auto, red_ckpm_auto = _lookup_team_priors(
-                team_history,
-                team_id=red_team_id_final,
-                team_name=red_team_name_final,
-            )
-            if blue_duration_auto is not None:
-                st.session_state["blue_duration_prior"] = float(blue_duration_auto)
-            if red_duration_auto is not None:
-                st.session_state["red_duration_prior"] = float(red_duration_auto)
-            if blue_ckpm_auto is not None:
-                st.session_state["blue_ckpm_prior"] = float(blue_ckpm_auto)
-            if red_ckpm_auto is not None:
-                st.session_state["red_ckpm_prior"] = float(red_ckpm_auto)
-
-        prior_col1, prior_col2 = st.columns(2)
-        with prior_col1:
-            blue_duration_prior = st.number_input(
-                "Blue rolling duration prior (seconds)",
-                step=10.0,
-                key="blue_duration_prior",
-            )
-            blue_ckpm_prior = st.number_input(
-                "Blue rolling CKPM prior",
-                step=0.01,
-                key="blue_ckpm_prior",
-            )
-        with prior_col2:
-            red_duration_prior = st.number_input(
-                "Red rolling duration prior (seconds)",
-                step=10.0,
-                key="red_duration_prior",
-            )
-            red_ckpm_prior = st.number_input(
-                "Red rolling CKPM prior",
-                step=0.01,
-                key="red_ckpm_prior",
-            )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown("### 4) Draft Champions by Role")
-        quick_col1, quick_col2 = st.columns(2)
-        with quick_col1:
-            blue_quick_roles = st.text_input(
-                "Blue quick input (top,jng,mid,bot,sup)",
-                key="blue_roles_quick",
-            )
-            parsed_blue = _parse_role_quick_input(blue_quick_roles)
-            if parsed_blue:
-                for idx, role in enumerate(ROLE_ORDER):
-                    st.session_state[f"blue_role_{role}"] = parsed_blue[idx]
-            elif _clean_text(blue_quick_roles):
-                st.caption("Blue quick input needs exactly 5 comma-separated champions.")
-        with quick_col2:
-            red_quick_roles = st.text_input(
-                "Red quick input (top,jng,mid,bot,sup)",
-                key="red_roles_quick",
-            )
-            parsed_red = _parse_role_quick_input(red_quick_roles)
-            if parsed_red:
-                for idx, role in enumerate(ROLE_ORDER):
-                    st.session_state[f"red_role_{role}"] = parsed_red[idx]
-            elif _clean_text(red_quick_roles):
-                st.caption("Red quick input needs exactly 5 comma-separated champions.")
-
-        champ_suggestions = options["champions"][:]
-        if not champ_suggestions:
-            champ_suggestions = ["Aatrox", "Lee Sin", "Orianna", "Jinx", "Nautilus"]
+        st.markdown("### Draft Champions")
+        q1, q2 = st.columns(2)
+        blue_roles_quick = q1.text_input("Blue quick input (top,jng,mid,bot,sup)", key="blue_roles_quick")
+        red_roles_quick = q2.text_input("Red quick input (top,jng,mid,bot,sup)", key="red_roles_quick")
 
         blue_roles: Dict[str, str] = {}
         red_roles: Dict[str, str] = {}
-        role_col1, role_col2 = st.columns(2)
-        with role_col1:
-            st.markdown("#### Blue Roles")
-            for role in ROLE_ORDER:
-                blue_roles[role] = st.selectbox(
-                    f"Blue {role.upper()}",
-                    options=_options_with_current(champ_suggestions, st.session_state.get(f"blue_role_{role}", "")),
-                    key=f"blue_role_{role}",
-                )
-        with role_col2:
-            st.markdown("#### Red Roles")
-            for role in ROLE_ORDER:
-                red_roles[role] = st.selectbox(
-                    f"Red {role.upper()}",
-                    options=_options_with_current(champ_suggestions, st.session_state.get(f"red_role_{role}", "")),
-                    key=f"red_role_{role}",
-                )
+        r1, r2 = st.columns(2)
+        for role in ROLE_ORDER:
+            blue_roles[role] = r1.selectbox(
+                f"Blue {role.upper()}",
+                options_with_current(champ_options, st.session_state.get(f"blue_role_{role}", "")),
+                key=f"blue_role_{role}",
+            )
+            red_roles[role] = r2.selectbox(
+                f"Red {role.upper()}",
+                options_with_current(champ_options, st.session_state.get(f"red_role_{role}", "")),
+                key=f"red_role_{role}",
+            )
 
-        with st.expander("Optional: Pick/Ban Overrides"):
-            st.caption("If left blank, picks default to role champions.")
-            blue_pick_inputs: List[str] = []
-            red_pick_inputs: List[str] = []
-            blue_ban_inputs: List[str] = []
-            red_ban_inputs: List[str] = []
+        with st.expander("Optional Pick / Ban Overrides"):
+            st.caption("If picks are blank, role champions are used.")
+            pb1, pb2 = st.columns(2)
+            blue_pick_inputs = [pb1.text_input(f"Blue pick{i}", key=f"blue_pick_{i}") for i in range(1, 6)]
+            red_pick_inputs = [pb2.text_input(f"Red pick{i}", key=f"red_pick_{i}") for i in range(1, 6)]
+            blue_ban_inputs = [pb1.text_input(f"Blue ban{i}", key=f"blue_ban_{i}") for i in range(1, 6)]
+            red_ban_inputs = [pb2.text_input(f"Red ban{i}", key=f"red_ban_{i}") for i in range(1, 6)]
 
-            pick_col1, pick_col2 = st.columns(2)
-            with pick_col1:
-                st.markdown("#### Blue Picks / Bans")
-                for idx in range(1, 6):
-                    blue_pick_inputs.append(st.text_input(f"Blue pick{idx}", key=f"blue_pick_{idx}"))
-                for idx in range(1, 6):
-                    blue_ban_inputs.append(st.text_input(f"Blue ban{idx}", key=f"blue_ban_{idx}"))
-            with pick_col2:
-                st.markdown("#### Red Picks / Bans")
-                for idx in range(1, 6):
-                    red_pick_inputs.append(st.text_input(f"Red pick{idx}", key=f"red_pick_{idx}"))
-                for idx in range(1, 6):
-                    red_ban_inputs.append(st.text_input(f"Red ban{idx}", key=f"red_ban_{idx}"))
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        submitted = st.form_submit_button("Predict Match Duration")
-
-    if not submitted:
-        st.info("Fill in draft details and click Predict Match Duration.")
-        st.stop()
-
-    validation_errors = _validate_draft_inputs(blue_roles, red_roles)
-    if not blue_team_name_final:
-        validation_errors.append("Blue team name is required.")
-    if not red_team_name_final:
-        validation_errors.append("Red team name is required.")
-    if blue_duration_prior <= 0 or red_duration_prior <= 0:
-        validation_errors.append("Duration priors must be positive.")
-    if blue_ckpm_prior <= 0 or red_ckpm_prior <= 0:
-        validation_errors.append("CKPM priors must be positive.")
-
-    if validation_errors:
-        for err in validation_errors:
-            st.error(err)
-        st.stop()
-
-    form_data = {
-        "league": league,
-        "patch": patch,
-        "split": split,
-        "year": year,
-        "playoffs": playoffs,
-        "blue_first_pick": blue_first_pick,
-        "blue_team_name": blue_team_name_final,
-        "red_team_name": red_team_name_final,
-        "blue_team_id": blue_team_id_final,
-        "red_team_id": red_team_id_final,
-        "blue_duration_prior": blue_duration_prior,
-        "red_duration_prior": red_duration_prior,
-        "blue_ckpm_prior": blue_ckpm_prior,
-        "red_ckpm_prior": red_ckpm_prior,
-        "blue_roles": blue_roles,
-        "red_roles": red_roles,
-        "blue_picks": blue_pick_inputs if "blue_pick_inputs" in locals() else [""] * 5,
-        "red_picks": red_pick_inputs if "red_pick_inputs" in locals() else [""] * 5,
-        "blue_bans": blue_ban_inputs if "blue_ban_inputs" in locals() else [""] * 5,
-        "red_bans": red_ban_inputs if "red_ban_inputs" in locals() else [""] * 5,
-    }
-    payload = _build_payload(form_data)
-
-    try:
-        prediction = predict_single_draft(
-            artifact_path=artifact_file,
-            draft_payload=payload,
-            include_explanation=include_explanation,
+        market_line_minutes = st.number_input(
+            "Optional market line (minutes) for over/under probability",
+            min_value=0.0,
+            step=0.25,
+            key="market_line_minutes",
         )
-    except Exception as exc:
-        st.error(f"Prediction failed: {exc}")
-        st.stop()
 
-    pred_minutes = float(prediction["predicted_duration_minutes"])
-    pred_seconds = float(prediction["predicted_duration_seconds"])
-    total_seconds = max(int(round(pred_seconds)), 0)
-    predicted_clock = f"{total_seconds // 60}:{total_seconds % 60:02d}"
-    mae_context = float(test_mae_minutes) if test_mae_minutes is not None else 4.2
-    lower_bound = max(pred_minutes - mae_context, 0.0)
-    upper_bound = pred_minutes + mae_context
+        submitted = st.form_submit_button("Generate Prediction", use_container_width=True)
 
-    st.markdown("### Prediction")
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-    metric_col1.metric("Predicted Duration", f"{pred_minutes:.2f} min")
-    metric_col2.metric("Predicted Seconds", f"{pred_seconds:.0f}s")
-    metric_col3.metric("Estimated Clock", predicted_clock)
-    st.caption(f"Typical historical error is about +/- {mae_context:.2f} minutes.")
-    st.info(f"Practical range for this match: roughly {lower_bound:.1f} to {upper_bound:.1f} minutes.")
+    if submitted:
+        usage = get_usage_snapshot()
+        if usage["remaining"] <= 0:
+            st.warning(
+                "Free prediction allowance reached for this month. Reset in Account/Usage or increase allowance."
+            )
+            return
 
-    with st.expander("Payload used for inference"):
-        st.json(payload)
+        if game_choice != "League of Legends":
+            st.warning(
+                "This app instance is currently wired to the League of Legends draft-duration model. "
+                "Select League of Legends to run prediction."
+            )
+            return
 
-    explanation = prediction.get("explanation")
-    if explanation:
-        st.markdown("### Explanation")
-        if explanation.get("warning"):
-            st.warning(explanation["warning"])
-        contribs = explanation.get("top_feature_contributions", [])
-        if contribs:
-            contrib_df = pd.DataFrame(contribs)
-            st.dataframe(contrib_df, use_container_width=True, hide_index=True)
+        blue_team_name_final = clean_text(blue_team_name_custom) or clean_text(blue_team_name)
+        red_team_name_final = clean_text(red_team_name_custom) or clean_text(red_team_name)
+        blue_team_id_final = clean_text(blue_team_id_custom) or clean_text(blue_team_id)
+        red_team_id_final = clean_text(red_team_id_custom) or clean_text(red_team_id)
+
+        parse_errors = []
+        if clean_text(blue_roles_quick):
+            parsed = parse_role_quick_input(blue_roles_quick)
+            if parsed:
+                for idx, role in enumerate(ROLE_ORDER):
+                    blue_roles[role] = parsed[idx]
+            else:
+                parse_errors.append("Blue quick input must contain exactly 5 champions.")
+
+        if clean_text(red_roles_quick):
+            parsed = parse_role_quick_input(red_roles_quick)
+            if parsed:
+                for idx, role in enumerate(ROLE_ORDER):
+                    red_roles[role] = parsed[idx]
+            else:
+                parse_errors.append("Red quick input must contain exactly 5 champions.")
+
+        validation_errors = parse_errors + validate_draft_inputs(blue_roles, red_roles)
+        if not blue_team_name_final:
+            validation_errors.append("Blue team name is required.")
+        if not red_team_name_final:
+            validation_errors.append("Red team name is required.")
+        if blue_duration_prior <= 0 or red_duration_prior <= 0:
+            validation_errors.append("Duration priors must be positive.")
+        if blue_ckpm_prior <= 0 or red_ckpm_prior <= 0:
+            validation_errors.append("CKPM priors must be positive.")
+
+        if validation_errors:
+            for err in validation_errors:
+                st.error(err)
+            return
+
+        form_data = {
+            "league": league,
+            "patch": patch,
+            "split": split,
+            "year": int(year),
+            "playoffs": bool(playoffs),
+            "blue_first_pick": bool(blue_first_pick),
+            "blue_team_name": blue_team_name_final,
+            "red_team_name": red_team_name_final,
+            "blue_team_id": blue_team_id_final,
+            "red_team_id": red_team_id_final,
+            "blue_duration_prior": float(blue_duration_prior),
+            "red_duration_prior": float(red_duration_prior),
+            "blue_ckpm_prior": float(blue_ckpm_prior),
+            "red_ckpm_prior": float(red_ckpm_prior),
+            "blue_roles": blue_roles,
+            "red_roles": red_roles,
+            "blue_picks": blue_pick_inputs,
+            "red_picks": red_pick_inputs,
+            "blue_bans": blue_ban_inputs,
+            "red_bans": red_ban_inputs,
+        }
+        payload = build_payload(form_data)
+
+        try:
+            prediction = predict_single_draft(
+                artifact_path=ctx.artifact_path,
+                draft_payload=payload,
+                include_explanation=ctx.include_explanation,
+            )
+        except Exception as exc:
+            st.error(f"Prediction failed: {exc}")
+            return
+
+        increment_usage()
+        prediction_id = str(uuid.uuid4())
+        primary_model = str((ctx.artifacts or {}).get("primary_model", "model"))
+        mae_context = ctx.test_mae_minutes
+        if mae_context is None:
+            mae_context = _resolve_primary_metric(ctx.metrics_payload, "mae_minutes")
+        if mae_context is None:
+            mae_context = 4.2
+
+        rmse_context = _resolve_primary_metric(ctx.metrics_payload, "rmse_minutes")
+        if rmse_context is None:
+            rmse_context = max(float(mae_context) * 1.3, 1.8)
+
+        result_record = {
+            "prediction_id": prediction_id,
+            "prediction_timestamp_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+            "game": game_choice,
+            "league": league,
+            "match_label": f"{blue_team_name_final} vs {red_team_name_final}",
+            "model_name": primary_model,
+            "predicted_duration_minutes": float(prediction["predicted_duration_minutes"]),
+            "predicted_duration_seconds": float(prediction["predicted_duration_seconds"]),
+            "mae_context_minutes": float(mae_context),
+            "rmse_context_minutes": float(rmse_context),
+            "market_line_minutes": float(market_line_minutes),
+            "payload": payload,
+            "explanation": prediction.get("explanation"),
+        }
+        st.session_state["last_prediction"] = result_record
+        st.session_state["last_saved_prediction_id"] = None
+
+    last_prediction = st.session_state.get("last_prediction")
+    if last_prediction:
+        _prediction_result_card(ctx, last_prediction)
+    else:
+        st.info("Fill the form and click Generate Prediction to see results.")
+
+
+def _render_calendar_page(ctx: AppContext) -> None:
+    st.markdown("## Calendar")
+    st.caption("Browse recent/prototype match templates and jump directly into prediction flow.")
+
+    board = ctx.calendar_board.copy()
+    if board.empty:
+        st.warning("No match table data found. Update the match table path in Runtime Settings.")
+        return
+
+    board["date"] = pd.to_datetime(board["date"], errors="coerce")
+    board = board.dropna(subset=["date"])
+
+    c1, c2, c3 = st.columns(3)
+    selected_game = c1.selectbox("Game", ["All", "League of Legends", "Counter-Strike 2", "Dota 2", "VALORANT"])
+    league_options = ["All"] + sorted(board["league"].dropna().astype(str).unique().tolist())
+    selected_league = c2.selectbox("League", league_options)
+    featured_only = c3.toggle("Featured only", value=False)
+
+    min_date = board["date"].min().date()
+    max_date = board["date"].max().date()
+    date_range = st.date_input("Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+
+    filtered = board.copy()
+    if selected_game != "All":
+        filtered = filtered[filtered["game"] == selected_game]
+    if selected_league != "All":
+        filtered = filtered[filtered["league"] == selected_league]
+    if featured_only:
+        filtered = filtered[filtered["featured"] == True]
+
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date = pd.Timestamp(date_range[0])
+        end_date = pd.Timestamp(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        filtered = filtered[(filtered["date"] >= start_date) & (filtered["date"] <= end_date)]
+
+    if filtered.empty:
+        st.info("No matches found with the current filters.")
+        return
+
+    filtered = filtered.sort_values("date", ascending=False)
+    featured_count = int(filtered["featured"].astype(bool).sum())
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Matches shown", int(len(filtered)))
+    k2.metric("Featured matches", featured_count)
+    k3.metric("Leagues shown", int(filtered["league"].nunique()))
+
+    display = filtered.copy()
+    display["date"] = display["date"].dt.strftime("%Y-%m-%d %H:%M")
+    display["featured"] = np.where(display["featured"], "Featured", "")
+    st.dataframe(
+        display[["date", "game", "league", "patch", "match", "featured"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    filtered["calendar_label"] = (
+        filtered["date"].dt.strftime("%Y-%m-%d")
+        + " | "
+        + filtered["league"].astype(str)
+        + " | "
+        + filtered["match"].astype(str)
+        + " | patch "
+        + filtered["patch"].astype(str)
+    )
+    selected_label = st.selectbox(
+        "Open match in prediction flow",
+        filtered["calendar_label"].tolist(),
+    )
+    if st.button("Use Selected Match in Predictions", use_container_width=True):
+        selected = filtered[filtered["calendar_label"] == selected_label]
+        if not selected.empty:
+            st.session_state["selected_template_gameid"] = str(selected.iloc[0]["gameid"])
+            _set_nav("Predictions")
+
+
+def _render_journal_page(ctx: AppContext) -> None:
+    st.markdown("## Journal")
+    st.caption("Track picks, update outcomes, and monitor long-term decision quality.")
+
+    journal_df = load_journal(ctx.journal_path)
+    if journal_df.empty:
+        st.info("No journal entries yet. Save predictions from the Predictions page.")
+        return
+
+    missing_id = journal_df["entry_id"].astype(str).str.strip().isin(["", "nan", "None"])
+    if missing_id.any():
+        journal_df.loc[missing_id, "entry_id"] = [str(uuid.uuid4()) for _ in range(int(missing_id.sum()))]
+        save_journal(ctx.journal_path, journal_df)
+
+    metrics = compute_journal_metrics(journal_df)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total picks", metrics["total_picks"])
+    m2.metric("Win rate", f"{metrics['win_rate'] * 100:.1f}%")
+    m3.metric("ROI", f"{metrics['roi'] * 100:.1f}%")
+    m4.metric("Profit/Loss", f"{metrics['profit_units']:.2f}u")
+    m5.metric("Avg odds", f"{metrics['avg_odds']:.2f}")
+
+    f1, f2, f3 = st.columns(3)
+    game_options = ["All"] + sorted(journal_df["game"].dropna().astype(str).unique().tolist())
+    status_options = ["All"] + sorted(journal_df["status"].dropna().astype(str).unique().tolist())
+    league_options = ["All"] + sorted(journal_df["league"].dropna().astype(str).unique().tolist())
+    selected_game = f1.selectbox("Game filter", game_options)
+    selected_status = f2.selectbox("Status filter", status_options)
+    selected_league = f3.selectbox("League filter", league_options)
+
+    filtered = journal_df.copy()
+    if selected_game != "All":
+        filtered = filtered[filtered["game"] == selected_game]
+    if selected_status != "All":
+        filtered = filtered[filtered["status"] == selected_status]
+    if selected_league != "All":
+        filtered = filtered[filtered["league"] == selected_league]
+
+    if filtered.empty:
+        st.info("No entries match the selected filters.")
+        return
+
+    sort_col = st.selectbox(
+        "Sort by",
+        ["created_at_utc", "profit_units", "odds_decimal", "league", "status"],
+    )
+    ascending = st.toggle("Ascending sort", value=False)
+    filtered = filtered.sort_values(sort_col, ascending=ascending, na_position="last")
+
+    view_cols = [
+        "created_at_utc",
+        "game",
+        "league",
+        "match_label",
+        "predicted_value",
+        "status",
+        "odds_decimal",
+        "stake_units",
+        "profit_units",
+        "notes",
+    ]
+    st.dataframe(filtered[view_cols], use_container_width=True, hide_index=True)
+
+    settled = filtered[filtered["status"].str.lower().isin(["won", "lost", "push"])].copy()
+    if not settled.empty:
+        settled["created_at_utc"] = pd.to_datetime(settled["created_at_utc"], errors="coerce")
+        settled = settled.sort_values("created_at_utc")
+        settled["profit_units"] = pd.to_numeric(settled["profit_units"], errors="coerce").fillna(0.0)
+        settled["cumulative_profit"] = settled["profit_units"].cumsum()
+        chart_df = settled[["created_at_utc", "cumulative_profit"]].set_index("created_at_utc")
+        st.line_chart(chart_df)
+
+    with st.expander("Edit Journal Entries"):
+        editable_cols = ["entry_id", "status", "odds_decimal", "stake_units", "notes"]
+        edit_df = filtered[editable_cols].copy()
+        edited = st.data_editor(
+            edit_df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            key="journal_editor",
+        )
+        if st.button("Save Entry Updates", use_container_width=True):
+            base = journal_df.set_index("entry_id")
+            edited_indexed = edited.set_index("entry_id")
+            for col in ["status", "odds_decimal", "stake_units", "notes"]:
+                base.loc[edited_indexed.index, col] = edited_indexed[col]
+            updated = base.reset_index()
+            save_journal(ctx.journal_path, updated)
+            st.success("Journal updates saved.")
+            st.rerun()
+
+
+def _load_optional_breakdown(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _render_model_performance_page(ctx: AppContext) -> None:
+    st.markdown("## Model Performance")
+    st.caption("Backtest metrics are shown transparently and should be interpreted as draft-only benchmarks.")
+
+    payload = ctx.metrics_payload
+    metrics_by_model = payload.get("metrics_by_model", {})
+    if not metrics_by_model:
+        st.warning("Metrics file not found or does not contain model metrics.")
+        return
+
+    primary_model = str(payload.get("primary_model", "unknown")).lower()
+    primary_metrics = metrics_by_model.get(primary_model, {})
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Primary model", primary_model.upper())
+    k2.metric("MAE", f"{_safe_float(primary_metrics.get('mae_minutes'), np.nan):.2f} min")
+    k3.metric("RMSE", f"{_safe_float(primary_metrics.get('rmse_minutes'), np.nan):.2f} min")
+    k4.metric(
+        "Within 5 min",
+        f"{_safe_float(primary_metrics.get('within_5_minutes_accuracy'), np.nan) * 100:.1f}%",
+    )
+
+    tab_lol, tab_cs2 = st.tabs(["League of Legends", "Counter-Strike 2"])
+    with tab_lol:
+        rows = []
+        for model_name, metrics in metrics_by_model.items():
+            rows.append(
+                {
+                    "model": model_name,
+                    "mae_minutes": _safe_float(metrics.get("mae_minutes"), np.nan),
+                    "rmse_minutes": _safe_float(metrics.get("rmse_minutes"), np.nan),
+                    "median_abs_error_minutes": _safe_float(metrics.get("median_absolute_error_minutes"), np.nan),
+                    "within_2_min": _safe_float(metrics.get("within_2_minutes_accuracy"), np.nan),
+                    "within_5_min": _safe_float(metrics.get("within_5_minutes_accuracy"), np.nan),
+                }
+            )
+        summary_df = pd.DataFrame(rows).sort_values("mae_minutes", ascending=True)
+        summary_df["within_2_min"] = (summary_df["within_2_min"] * 100.0).round(2)
+        summary_df["within_5_min"] = (summary_df["within_5_min"] * 100.0).round(2)
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+        split_info = payload.get("split", {})
+        if split_info:
+            st.markdown("#### Chronological Split")
+            split_df = pd.DataFrame([split_info])
+            st.dataframe(split_df, use_container_width=True, hide_index=True)
+
+        base_dir = ctx.metrics_path.parent
+        league_df = _load_optional_breakdown(base_dir / "error_by_league.csv")
+        patch_df = _load_optional_breakdown(base_dir / "error_by_patch.csv")
+        bucket_df = _load_optional_breakdown(base_dir / "error_by_duration_bucket.csv")
+
+        if not league_df.empty:
+            st.markdown("#### Error by League")
+            st.dataframe(league_df, use_container_width=True, hide_index=True)
+        if not patch_df.empty:
+            st.markdown("#### Error by Patch")
+            st.dataframe(patch_df, use_container_width=True, hide_index=True)
+        if not bucket_df.empty:
+            st.markdown("#### Error by Duration Bucket")
+            st.dataframe(bucket_df, use_container_width=True, hide_index=True)
+
+        st.info(
+            "These metrics come from chronological holdout evaluation. Draft-only predictions are noisier "
+            "than live-state models that use in-game telemetry."
+        )
+
+    with tab_cs2:
+        st.markdown(
+            """
+            <div class="app-card">
+                <b>CS2 model panel is ready.</b><br/>
+                Connect a CS2 metrics payload to render the same benchmark structure here.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption("Current backend integration in this app instance points to the LoL model artifact.")
+
+
+def _render_account_page(ctx: AppContext) -> None:
+    st.markdown("## Account / Usage")
+    usage = get_usage_snapshot()
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Monthly allowance", usage["allowance"])
+    m2.metric("Used this month", usage["used"])
+    m3.metric("Remaining", usage["remaining"])
+
+    progress = 0.0
+    if usage["allowance"] > 0:
+        progress = min(float(usage["used"]) / float(usage["allowance"]), 1.0)
+    st.progress(progress, text=f"Usage month: {usage['month']}")
+
+    c1, c2 = st.columns(2)
+    allowance_input = c1.number_input(
+        "Set free monthly allowance",
+        min_value=1,
+        max_value=1000,
+        value=int(st.session_state.get("usage_allowance", FREE_PREDICTIONS_PER_MONTH)),
+        step=1,
+    )
+    if c1.button("Update allowance", use_container_width=True):
+        st.session_state["usage_allowance"] = int(allowance_input)
+        st.success("Usage allowance updated.")
+        st.rerun()
+
+    if c2.button("Reset usage counter", use_container_width=True):
+        reset_usage()
+        st.success("Usage counter reset for current month.")
+        st.rerun()
+
+    st.markdown("### Data Paths")
+    path_df = pd.DataFrame(
+        [
+            {"artifact_path": str(ctx.artifact_path)},
+            {"match_table_path": str(ctx.match_table_path)},
+            {"metrics_path": str(ctx.metrics_path)},
+            {"journal_path": str(ctx.journal_path)},
+        ]
+    )
+    st.dataframe(path_df, use_container_width=True, hide_index=True)
+
+    journal_df = load_journal(ctx.journal_path)
+    if not journal_df.empty:
+        csv_bytes = journal_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Journal CSV",
+            data=csv_bytes,
+            file_name="prediction_journal.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
+def main() -> None:
+    st.set_page_config(page_title="MinuteModel", page_icon=":chart_with_upwards_trend:", layout="wide")
+    apply_app_styles()
+    ensure_usage_state()
+
+    _render_top_nav()
+    settings = _render_sidebar_settings()
+    ctx = _load_context(
+        artifact_path=settings["artifact_path"],
+        match_table_path=settings["match_table_path"],
+        metrics_path=settings["metrics_path"],
+        journal_path=settings["journal_path"],
+        include_explanation=bool(settings["include_explanation"]),
+    )
+
+    page = st.session_state.get("nav_page", "Home")
+    if page == "Home":
+        _render_home_page(ctx)
+    elif page == "Predictions":
+        _render_predictions_page(ctx)
+    elif page == "Calendar":
+        _render_calendar_page(ctx)
+    elif page == "Journal":
+        _render_journal_page(ctx)
+    elif page == "Model Performance":
+        _render_model_performance_page(ctx)
+    elif page == "Account / Usage":
+        _render_account_page(ctx)
+    else:
+        st.error(f"Unknown page: {page}")
 
 
 if __name__ == "__main__":
