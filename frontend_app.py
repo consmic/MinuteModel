@@ -35,8 +35,13 @@ from frontend_ui import (
     options_with_current,
     parse_role_quick_input,
     recent_template_rows,
+    render_empty_state,
+    render_info_panel,
+    render_page_intro,
+    render_section_heading,
     reset_usage,
     save_journal,
+    status_label,
     swap_form_sides,
     team_history_view,
     validate_draft_inputs,
@@ -122,6 +127,38 @@ def _resolve_primary_metric(metrics_payload: Dict[str, Any], metric_name: str) -
     return None
 
 
+def _style_status_dataframe(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    work = df.copy()
+
+    def _cell_style(value: Any) -> str:
+        token = str(value).strip().lower()
+        if token == "won":
+            return "background-color: rgba(32, 211, 141, 0.18); color: #c8f9e6; font-weight: 700;"
+        if token == "lost":
+            return "background-color: rgba(255, 95, 126, 0.18); color: #ffd8e1; font-weight: 700;"
+        if token == "push":
+            return "background-color: rgba(244, 187, 74, 0.18); color: #ffe9b7; font-weight: 700;"
+        return "background-color: rgba(158, 176, 204, 0.16); color: #d9e5fa; font-weight: 600;"
+
+    style_cols = [col for col in ["status"] if col in work.columns]
+    styler = work.style
+    if style_cols:
+        styler = styler.applymap(_cell_style, subset=style_cols)
+    return styler
+
+
+def _match_selector_options(template_rows: pd.DataFrame, league: str) -> list[str]:
+    if template_rows.empty:
+        return [""]
+    subset = template_rows.copy()
+    if clean_text(league):
+        subset = subset[subset["league"].astype(str) == str(league)]
+    if subset.empty:
+        subset = template_rows.copy()
+    options = subset["template_label"].astype(str).tolist()
+    return [""] + options
+
+
 def _load_context(
     artifact_path: str,
     match_table_path: str,
@@ -173,9 +210,16 @@ def _render_top_nav() -> str:
         st.session_state["nav_page"] = "Home"
 
     with st.sidebar:
-        st.markdown("### MinuteModel")
-        st.caption("Esports prediction workspace")
-        selected = st.radio("Navigate", NAV_ITEMS, key="nav_page")
+        st.markdown(
+            """
+            <div style="padding:0.2rem 0 0.6rem 0;">
+              <div style="font-family:'Sora',sans-serif;font-weight:800;font-size:1.05rem;">MinuteModel</div>
+              <div style="font-size:0.78rem;color:#9fb3cf;">Esports Prediction Desk</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        selected = st.radio("Navigation", NAV_ITEMS, key="nav_page")
     return selected
 
 
@@ -193,8 +237,8 @@ def _render_sidebar_settings() -> Dict[str, Any]:
 
     usage = get_usage_snapshot()
     with st.sidebar:
-        st.metric("Free predictions left", usage["remaining"])
-        st.caption(f"Used {usage['used']} / {usage['allowance']} in {usage['month']}")
+        st.metric("Free Predictions Left", usage["remaining"])
+        st.caption(f"{usage['used']} / {usage['allowance']} used in {usage['month']}")
 
         with st.expander("Runtime Settings", expanded=False):
             st.text_input("Model artifact", key="artifact_path")
@@ -202,6 +246,8 @@ def _render_sidebar_settings() -> Dict[str, Any]:
             st.text_input("Metrics file", key="metrics_path")
             st.text_input("Journal file", key="journal_path")
             st.checkbox("Include SHAP explanation", key="include_explanation")
+
+        st.caption("Tip: keep runtime settings collapsed for a cleaner workflow.")
 
     return {
         "artifact_path": str(st.session_state["artifact_path"]),
@@ -235,65 +281,39 @@ def _render_home_page(ctx: AppContext) -> None:
     mae = ctx.test_mae_minutes if ctx.test_mae_minutes is not None else _resolve_primary_metric(ctx.metrics_payload, "mae_minutes")
     rmse = _resolve_primary_metric(ctx.metrics_payload, "rmse_minutes")
     within5 = _resolve_primary_metric(ctx.metrics_payload, "within_5_minutes_accuracy")
-
-    st.markdown(
-        f"""
-        <div class="hero-shell">
-            <div class="subtle-label">Esports Prediction Platform</div>
-            <h1 style="margin:0.1rem 0 0.4rem 0;">MinuteModel</h1>
-            <p style="margin:0 0 0.6rem 0; max-width:860px;">
-            Draft-aware match predictions designed for fast decision making. Generate pre-game estimates in seconds,
-            track outcomes in your journal, and monitor model quality over time.
-            </p>
-            <span class="badge">League of Legends: Live</span>
-            <span class="badge">CS2: Frontend Ready</span>
-            <span class="badge">Dota 2: Planned</span>
-            <span class="badge">VALORANT: Planned</span>
-            <span class="badge">Free predictions left: {usage['remaining']}</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_page_intro(
+        title="Pro Esports Predictions, Draft to Decision",
+        subtitle=(
+            "Generate pre-game projections in seconds, monitor performance in a personal journal, "
+            "and keep model confidence visible at every step."
+        ),
+        badges=[
+            "LoL: Live",
+            "CS2: Frontend Ready",
+            "Dota 2: Planned",
+            "VALORANT: Planned",
+            f"Free predictions left: {usage['remaining']}",
+        ],
+        eyebrow="Esports Oracle Workflow",
     )
     _home_cta_buttons()
-
-    st.markdown("### How It Works")
-    h1, h2, h3 = st.columns(3)
-    h1.markdown(
-        """
-        <div class="app-card">
-            <b>1) Select Match Context</b><br/>
-            Choose game, league, patch, teams, and draft details.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    h2.markdown(
-        """
-        <div class="app-card">
-            <b>2) Generate Prediction</b><br/>
-            The model estimates expected match duration using pre-game information only.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    h3.markdown(
-        """
-        <div class="app-card">
-            <b>3) Track Outcomes</b><br/>
-            Save predictions to the journal and evaluate long-term performance.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("### Model Snapshot")
+    render_section_heading("Model Snapshot", "Current benchmark context for the production model.")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Primary model", primary_model)
     m2.metric("MAE (minutes)", f"{mae:.2f}" if mae is not None else "N/A")
     m3.metric("RMSE (minutes)", f"{rmse:.2f}" if rmse is not None else "N/A")
     m4.metric("Within 5 min", f"{within5 * 100:.1f}%" if within5 is not None else "N/A")
 
-    st.markdown("### Supported Games")
+    render_section_heading("How It Works", "New users should be prediction-ready in under a minute.")
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        render_info_panel("1) Pick Match Context", "Select game, league, and a match template or custom draft.")
+    with h2:
+        render_info_panel("2) Generate Projection", "Run the model and review forecast, confidence, and key factors.")
+    with h3:
+        render_info_panel("3) Track Outcomes", "Log picks in Journal to monitor win-rate, ROI, and profit trends.")
+
+    render_section_heading("Supported Games", "Coverage roadmap for the platform.")
     games = pd.DataFrame(
         [
             {"Game": "League of Legends", "Status": "Active", "Available prediction": "Draft-only match duration"},
@@ -304,16 +324,17 @@ def _render_home_page(ctx: AppContext) -> None:
     )
     st.dataframe(games, use_container_width=True, hide_index=True)
 
-    st.markdown("### Trust and Methodology")
-    st.info(
-        "Predictions on this app are pre-game only. The model never uses in-game or post-game stats for this view, "
-        "so outputs are a draft benchmark rather than a live-state oracle."
+    render_section_heading("Trust & Methodology", "Clear assumptions keep the product transparent.")
+    render_info_panel(
+        "What this model is",
+        "A draft-only benchmark. It uses information available before game start and does not leak in-game outcomes.",
+        tone="positive",
     )
     st.markdown(
         """
-        - Chronological validation is used to mimic future match forecasting.
-        - Results are benchmarked against simple baselines for transparency.
-        - Explanations are model-behavior diagnostics, not causal claims.
+        - Validation is chronological, not random, to mirror real forward predictions.
+        - Baselines are tracked so model value is measured honestly.
+        - Explanations describe model behavior, not causal certainty.
         """
     )
 
@@ -381,15 +402,19 @@ def _prediction_result_card(ctx: AppContext, result: Dict[str, Any]) -> None:
     upper = pred_minutes + mae_minutes
 
     confidence_label = "Directional"
-    confidence_detail = "No market line selected."
+    confidence_detail = "Set a market line to derive directional probability."
     p_over = None
     p_under = None
     edge_pct = None
+    predicted_side = "N/A"
+    win_probability = None
 
     if line_minutes > 0:
         z = (pred_minutes - line_minutes) / max(rmse_minutes, 1e-6)
         p_over = float(_normal_cdf(z))
         p_under = float(1.0 - p_over)
+        predicted_side = f"Over {line_minutes:.1f}m" if p_over >= p_under else f"Under {line_minutes:.1f}m"
+        win_probability = max(p_over, p_under)
         edge_pct = float(abs(max(p_over, p_under) - 0.5) * 100.0)
         if edge_pct >= 15:
             confidence_label = "High"
@@ -403,35 +428,29 @@ def _prediction_result_card(ctx: AppContext, result: Dict[str, Any]) -> None:
         )
 
     timestamp = result.get("prediction_timestamp_utc", pd.Timestamp.now(tz="UTC").isoformat())
-    st.markdown(
-        f"""
-        <div class="app-card">
-            <div class="subtle-label">Prediction Result</div>
-            <h3 style="margin-top:0.15rem;">Expected Match Duration: {pred_minutes:.2f} minutes</h3>
-            <p style="margin:0.15rem 0;">
-                Estimated practical range: <b>{lower:.1f} to {upper:.1f} minutes</b> (based on historical MAE).
-            </p>
-            <p style="margin:0.15rem 0;">Timestamp (UTC): {timestamp}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    render_section_heading("Prediction Result", "Core output and confidence diagnostics.")
+    render_info_panel(
+        "Expected Match Duration",
+        f"{pred_minutes:.2f} minutes ({_clock_from_seconds(pred_seconds)} clock). "
+        f"Practical range: {lower:.1f} to {upper:.1f} minutes.",
+        tone="positive",
     )
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Predicted duration", f"{pred_minutes:.2f} min")
-    k2.metric("Clock estimate", _clock_from_seconds(pred_seconds))
-    k3.metric("Confidence", confidence_label)
+    k1.metric("Predicted winner / side", predicted_side)
+    k2.metric("Win probability", f"{win_probability * 100:.1f}%" if win_probability is not None else "N/A")
+    k3.metric("Confidence / edge", f"{confidence_label}{f' ({edge_pct:.1f}%)' if edge_pct is not None else ''}")
     k4.metric("Free predictions left", get_usage_snapshot()["remaining"])
 
     if line_minutes > 0 and p_over is not None and p_under is not None:
         st.info(
-            f"{confidence_detail}. Estimated edge: {edge_pct:.1f}%."
+            f"{confidence_detail}. Estimated edge: {edge_pct:.1f}%. Timestamp: {timestamp}"
         )
         st.caption(
             "Probability uses a normal error approximation around model RMSE and should be treated as directional."
         )
     else:
-        st.caption("Add an optional market line to estimate over/under probability and edge.")
+        st.caption(f"{confidence_detail} Timestamp: {timestamp}")
 
     explanation = result.get("explanation")
     if explanation:
@@ -445,7 +464,7 @@ def _prediction_result_card(ctx: AppContext, result: Dict[str, Any]) -> None:
                 top_df["abs_shap"] = top_df["shap_value"].abs()
                 top_df = top_df.sort_values("abs_shap", ascending=False)
                 top_df["shap_value"] = top_df["shap_value"].round(4)
-            st.markdown("#### Key Supporting Factors")
+            render_section_heading("Key Supporting Factors")
             cols = [c for c in ["feature", "impact", "shap_value"] if c in top_df.columns]
             st.dataframe(top_df[cols], use_container_width=True, hide_index=True)
 
@@ -504,36 +523,55 @@ def _prediction_result_card(ctx: AppContext, result: Dict[str, Any]) -> None:
 
 
 def _render_predictions_page(ctx: AppContext) -> None:
-    st.markdown("## Predictions")
-    st.caption("Build pre-game inputs, generate a forecast, and optionally log it in your journal.")
+    usage = get_usage_snapshot()
+    render_page_intro(
+        title="Predictions",
+        subtitle="Configure pre-game inputs and generate a production inference in one flow.",
+        badges=[
+            "Primary action",
+            f"Free predictions left: {usage['remaining']}",
+            "Draft-only model",
+        ],
+        eyebrow="Prediction Console",
+    )
 
     if ctx.artifact_error:
-        st.error(ctx.artifact_error)
-        st.info("Update the model artifact path in the sidebar to enable predictions.")
+        render_info_panel("Model artifact missing", ctx.artifact_error, tone="danger")
+        st.info("Update the model artifact path in Runtime Settings to enable predictions.")
         return
 
     defaults = default_form_state(ctx.options, default_year=_default_year_from_table(ctx.match_df))
     if "market_line_minutes" not in st.session_state:
         st.session_state["market_line_minutes"] = 0.0
+    if "prediction_league_selector" not in st.session_state:
+        st.session_state["prediction_league_selector"] = st.session_state.get("league", "")
+    if "prediction_match_selector" not in st.session_state:
+        st.session_state["prediction_match_selector"] = ""
     ensure_form_state(defaults)
     _consume_calendar_prefill(ctx, defaults)
 
-    template_labels = []
-    if not ctx.template_rows.empty:
-        template_labels = [""] + ctx.template_rows["template_label"].tolist()
-
     with st.container(border=True):
-        st.markdown("### Draft Setup")
-        c1, c2 = st.columns(2)
-        selected_template_label = c1.selectbox(
-            "Start from recent match template",
-            template_labels,
-            index=0,
-            help="Loads known teams and draft context as a starting point.",
+        render_section_heading("Match Selection", "Pick game, league, and optional match template before editing draft details.")
+        s1, s2, s3 = st.columns(3)
+        game_choice = s1.selectbox("Game", SUPPORTED_GAMES, key="game")
+        league_selector = s2.selectbox(
+            "Region / League",
+            options_with_current(ctx.options["leagues"], st.session_state.get("prediction_league_selector", "")),
+            key="prediction_league_selector",
         )
-        c2.caption("Use template + adjust manually for upcoming matches.")
+        template_options = _match_selector_options(ctx.template_rows, league_selector)
+        selected_template_label = s3.selectbox(
+            "Match selector",
+            template_options,
+            key="prediction_match_selector",
+            help="Loads a recent match as a starting scaffold.",
+        )
+
+        if clean_text(league_selector):
+            st.session_state["league"] = league_selector
+
         b1, b2, b3, b4 = st.columns(4)
-        if b1.button("Load Template", use_container_width=True, disabled=not bool(selected_template_label)):
+        if b1.button("Load Match", use_container_width=True, disabled=not bool(selected_template_label)):
             _apply_template_selection(ctx, defaults, selected_template_label)
             st.rerun()
         if b2.button("Swap Blue/Red", use_container_width=True):
@@ -548,6 +586,13 @@ def _render_predictions_page(ctx: AppContext) -> None:
             st.session_state["market_line_minutes"] = 0.0
             st.rerun()
 
+    if game_choice != "League of Legends":
+        render_info_panel(
+            "Backend routing notice",
+            "This deployment is currently wired to the LoL draft-duration model. Switch to League of Legends to run inference.",
+            tone="warning",
+        )
+
     filled_roles = sum(
         bool(clean_text(st.session_state.get(f"{side}_role_{role}", "")))
         for side in ["blue", "red"]
@@ -560,60 +605,62 @@ def _render_predictions_page(ctx: AppContext) -> None:
         champ_options = ["Aatrox", "Lee Sin", "Orianna", "Jinx", "Nautilus"]
 
     with st.form("prediction_form", clear_on_submit=False):
-        st.markdown("### Match Context")
-        m1, m2 = st.columns(2)
-        game_choice = m1.selectbox("Game", SUPPORTED_GAMES, key="game")
-        league = m2.selectbox(
-            "Region / League",
-            options_with_current(ctx.options["leagues"], st.session_state.get("league", "")),
-            key="league",
-        )
-        m3, m4, m5, m6 = st.columns(4)
-        patch = m3.selectbox(
+        render_section_heading("Prediction Form", "Complete draft, priors, and market context to generate output.")
+        m1, m2, m3 = st.columns(3)
+        patch = m1.selectbox(
             "Patch",
             options_with_current(ctx.options["patches"], st.session_state.get("patch", "")),
             key="patch",
         )
-        split = m4.selectbox(
+        split = m2.selectbox(
             "Split",
             options_with_current(ctx.options["splits"], st.session_state.get("split", "")),
             key="split",
         )
-        year = m5.number_input("Year", min_value=2020, max_value=2035, step=1, key="year")
-        playoffs = m6.toggle("Playoffs", key="playoffs")
-        blue_first_pick = st.toggle("Blue side has first pick", key="blue_first_pick")
+        year = m3.number_input("Year", min_value=2020, max_value=2035, step=1, key="year")
+        m4, m5, m6 = st.columns(3)
+        playoffs = m4.toggle("Playoffs", key="playoffs")
+        blue_first_pick = m5.toggle("Blue has first pick", key="blue_first_pick")
+        market_line_minutes = m6.number_input(
+            "Market line (minutes)",
+            min_value=0.0,
+            step=0.25,
+            key="market_line_minutes",
+            help="Optional over/under line to estimate directional probability.",
+        )
 
-        st.markdown("### Teams")
+        render_section_heading("Teams", "Set team names/IDs and optional custom overrides.")
         t1, t2 = st.columns(2)
-        blue_team_name = t1.selectbox(
-            "Blue team name",
-            options_with_current(ctx.options["team_names"], st.session_state.get("blue_team_name", "")),
-            key="blue_team_name",
-        )
-        red_team_name = t2.selectbox(
-            "Red team name",
-            options_with_current(ctx.options["team_names"], st.session_state.get("red_team_name", "")),
-            key="red_team_name",
-        )
-        t3, t4 = st.columns(2)
-        blue_team_name_custom = t3.text_input("Blue team name override", key="blue_team_name_custom")
-        red_team_name_custom = t4.text_input("Red team name override", key="red_team_name_custom")
-        t5, t6 = st.columns(2)
-        blue_team_id = t5.selectbox(
-            "Blue team ID",
-            options_with_current(ctx.options["team_ids"], st.session_state.get("blue_team_id", "")),
-            key="blue_team_id",
-        )
-        red_team_id = t6.selectbox(
-            "Red team ID",
-            options_with_current(ctx.options["team_ids"], st.session_state.get("red_team_id", "")),
-            key="red_team_id",
-        )
-        t7, t8 = st.columns(2)
-        blue_team_id_custom = t7.text_input("Blue team ID override", key="blue_team_id_custom")
-        red_team_id_custom = t8.text_input("Red team ID override", key="red_team_id_custom")
+        with t1:
+            st.markdown("#### Blue Side")
+            blue_team_name = st.selectbox(
+                "Team name",
+                options_with_current(ctx.options["team_names"], st.session_state.get("blue_team_name", "")),
+                key="blue_team_name",
+            )
+            blue_team_name_custom = st.text_input("Team name override", key="blue_team_name_custom")
+            blue_team_id = st.selectbox(
+                "Team ID",
+                options_with_current(ctx.options["team_ids"], st.session_state.get("blue_team_id", "")),
+                key="blue_team_id",
+            )
+            blue_team_id_custom = st.text_input("Team ID override", key="blue_team_id_custom")
+        with t2:
+            st.markdown("#### Red Side")
+            red_team_name = st.selectbox(
+                "Team name",
+                options_with_current(ctx.options["team_names"], st.session_state.get("red_team_name", "")),
+                key="red_team_name",
+            )
+            red_team_name_custom = st.text_input("Team name override", key="red_team_name_custom")
+            red_team_id = st.selectbox(
+                "Team ID",
+                options_with_current(ctx.options["team_ids"], st.session_state.get("red_team_id", "")),
+                key="red_team_id",
+            )
+            red_team_id_custom = st.text_input("Team ID override", key="red_team_id_custom")
 
-        st.markdown("### Historical Priors")
+        render_section_heading("Historical Priors", "Rolling priors improve stability for unseen or sparse contexts.")
         p1, p2 = st.columns(2)
         blue_duration_prior = p1.number_input(
             "Blue rolling duration prior (seconds)",
@@ -641,7 +688,7 @@ def _render_predictions_page(ctx: AppContext) -> None:
             key="red_ckpm_prior",
         )
 
-        st.markdown("### Draft Champions")
+        render_section_heading("Draft Champions", "Role-specific champions are required for both sides.")
         q1, q2 = st.columns(2)
         blue_roles_quick = q1.text_input("Blue quick input (top,jng,mid,bot,sup)", key="blue_roles_quick")
         red_roles_quick = q2.text_input("Red quick input (top,jng,mid,bot,sup)", key="red_roles_quick")
@@ -649,34 +696,34 @@ def _render_predictions_page(ctx: AppContext) -> None:
         blue_roles: Dict[str, str] = {}
         red_roles: Dict[str, str] = {}
         r1, r2 = st.columns(2)
-        for role in ROLE_ORDER:
-            blue_roles[role] = r1.selectbox(
-                f"Blue {role.upper()}",
-                options_with_current(champ_options, st.session_state.get(f"blue_role_{role}", "")),
-                key=f"blue_role_{role}",
-            )
-            red_roles[role] = r2.selectbox(
-                f"Red {role.upper()}",
-                options_with_current(champ_options, st.session_state.get(f"red_role_{role}", "")),
-                key=f"red_role_{role}",
-            )
+        with r1:
+            st.markdown("#### Blue Draft")
+            for role in ROLE_ORDER:
+                blue_roles[role] = st.selectbox(
+                    f"{role.upper()}",
+                    options_with_current(champ_options, st.session_state.get(f"blue_role_{role}", "")),
+                    key=f"blue_role_{role}",
+                )
+        with r2:
+            st.markdown("#### Red Draft")
+            for role in ROLE_ORDER:
+                red_roles[role] = st.selectbox(
+                    f"{role.upper()}",
+                    options_with_current(champ_options, st.session_state.get(f"red_role_{role}", "")),
+                    key=f"red_role_{role}",
+                )
 
         with st.expander("Optional Pick / Ban Overrides"):
             st.caption("If picks are blank, role champions are used.")
-            pb1, pb2 = st.columns(2)
-            blue_pick_inputs = [pb1.text_input(f"Blue pick{i}", key=f"blue_pick_{i}") for i in range(1, 6)]
-            red_pick_inputs = [pb2.text_input(f"Red pick{i}", key=f"red_pick_{i}") for i in range(1, 6)]
-            blue_ban_inputs = [pb1.text_input(f"Blue ban{i}", key=f"blue_ban_{i}") for i in range(1, 6)]
-            red_ban_inputs = [pb2.text_input(f"Red ban{i}", key=f"red_ban_{i}") for i in range(1, 6)]
+            tab_blue, tab_red = st.tabs(["Blue Overrides", "Red Overrides"])
+            with tab_blue:
+                blue_pick_inputs = [st.text_input(f"Blue pick{i}", key=f"blue_pick_{i}") for i in range(1, 6)]
+                blue_ban_inputs = [st.text_input(f"Blue ban{i}", key=f"blue_ban_{i}") for i in range(1, 6)]
+            with tab_red:
+                red_pick_inputs = [st.text_input(f"Red pick{i}", key=f"red_pick_{i}") for i in range(1, 6)]
+                red_ban_inputs = [st.text_input(f"Red ban{i}", key=f"red_ban_{i}") for i in range(1, 6)]
 
-        market_line_minutes = st.number_input(
-            "Optional market line (minutes) for over/under probability",
-            min_value=0.0,
-            step=0.25,
-            key="market_line_minutes",
-        )
-
-        submitted = st.form_submit_button("Generate Prediction", use_container_width=True)
+        submitted = st.form_submit_button("Generate Prediction", use_container_width=True, type="primary")
 
     if submitted:
         usage = get_usage_snapshot()
@@ -731,7 +778,7 @@ def _render_predictions_page(ctx: AppContext) -> None:
             return
 
         form_data = {
-            "league": league,
+            "league": st.session_state.get("prediction_league_selector", st.session_state.get("league", "")),
             "patch": patch,
             "split": split,
             "year": int(year),
@@ -755,11 +802,12 @@ def _render_predictions_page(ctx: AppContext) -> None:
         payload = build_payload(form_data)
 
         try:
-            prediction = predict_single_draft(
-                artifact_path=ctx.artifact_path,
-                draft_payload=payload,
-                include_explanation=ctx.include_explanation,
-            )
+            with st.spinner("Running model inference..."):
+                prediction = predict_single_draft(
+                    artifact_path=ctx.artifact_path,
+                    draft_payload=payload,
+                    include_explanation=ctx.include_explanation,
+                )
         except Exception as exc:
             st.error(f"Prediction failed: {exc}")
             return
@@ -781,7 +829,7 @@ def _render_predictions_page(ctx: AppContext) -> None:
             "prediction_id": prediction_id,
             "prediction_timestamp_utc": pd.Timestamp.now(tz="UTC").isoformat(),
             "game": game_choice,
-            "league": league,
+            "league": st.session_state.get("prediction_league_selector", st.session_state.get("league", "")),
             "match_label": f"{blue_team_name_final} vs {red_team_name_final}",
             "model_name": primary_model,
             "predicted_duration_minutes": float(prediction["predicted_duration_minutes"]),
@@ -799,21 +847,32 @@ def _render_predictions_page(ctx: AppContext) -> None:
     if last_prediction:
         _prediction_result_card(ctx, last_prediction)
     else:
-        st.info("Fill the form and click Generate Prediction to see results.")
+        render_empty_state(
+            "No prediction generated yet",
+            "Configure match details and click Generate Prediction to populate this panel.",
+        )
 
 
 def _render_calendar_page(ctx: AppContext) -> None:
-    st.markdown("## Calendar")
-    st.caption("Browse recent/prototype match templates and jump directly into prediction flow.")
+    render_page_intro(
+        title="Calendar",
+        subtitle="Scan upcoming/recent matches, filter quickly, and move selected fixtures into Predictions.",
+        badges=["High scanability", "Featured match tagging"],
+        eyebrow="Match Board",
+    )
 
     board = ctx.calendar_board.copy()
     if board.empty:
-        st.warning("No match table data found. Update the match table path in Runtime Settings.")
+        render_empty_state(
+            "No match data available",
+            "Update the match table path in Runtime Settings to populate the calendar.",
+        )
         return
 
     board["date"] = pd.to_datetime(board["date"], errors="coerce")
     board = board.dropna(subset=["date"])
 
+    render_section_heading("Filters", "Narrow by game, league, date range, and featured status.")
     c1, c2, c3 = st.columns(3)
     selected_game = c1.selectbox("Game", ["All", "League of Legends", "Counter-Strike 2", "Dota 2", "VALORANT"])
     league_options = ["All"] + sorted(board["league"].dropna().astype(str).unique().tolist())
@@ -838,11 +897,12 @@ def _render_calendar_page(ctx: AppContext) -> None:
         filtered = filtered[(filtered["date"] >= start_date) & (filtered["date"] <= end_date)]
 
     if filtered.empty:
-        st.info("No matches found with the current filters.")
+        render_empty_state("No matches found", "Adjust filters to see more fixtures.")
         return
 
     filtered = filtered.sort_values("date", ascending=False)
     featured_count = int(filtered["featured"].astype(bool).sum())
+    render_section_heading("Calendar Overview")
     k1, k2, k3 = st.columns(3)
     k1.metric("Matches shown", int(len(filtered)))
     k2.metric("Featured matches", featured_count)
@@ -850,9 +910,11 @@ def _render_calendar_page(ctx: AppContext) -> None:
 
     display = filtered.copy()
     display["date"] = display["date"].dt.strftime("%Y-%m-%d %H:%M")
-    display["featured"] = np.where(display["featured"], "Featured", "")
+    display["featured"] = np.where(display["featured"], "Featured", "Standard")
+    display["interest"] = np.where(display["featured"] == "Featured", "High", "Normal")
+    display = display.rename(columns={"match": "matchup"})
     st.dataframe(
-        display[["date", "game", "league", "patch", "match", "featured"]],
+        display[["date", "game", "league", "patch", "matchup", "featured", "interest"]],
         use_container_width=True,
         hide_index=True,
     )
@@ -866,6 +928,7 @@ def _render_calendar_page(ctx: AppContext) -> None:
         + " | patch "
         + filtered["patch"].astype(str)
     )
+    render_section_heading("Jump to Predictions", "Choose a match and load it directly into the prediction form.")
     selected_label = st.selectbox(
         "Open match in prediction flow",
         filtered["calendar_label"].tolist(),
@@ -878,12 +941,19 @@ def _render_calendar_page(ctx: AppContext) -> None:
 
 
 def _render_journal_page(ctx: AppContext) -> None:
-    st.markdown("## Journal")
-    st.caption("Track picks, update outcomes, and monitor long-term decision quality.")
+    render_page_intro(
+        title="Journal",
+        subtitle="Your lightweight performance dashboard for tracking picks, outcomes, and betting efficiency.",
+        badges=["KPI tracking", "Editable outcomes", "Profit curve"],
+        eyebrow="Performance Journal",
+    )
 
     journal_df = load_journal(ctx.journal_path)
     if journal_df.empty:
-        st.info("No journal entries yet. Save predictions from the Predictions page.")
+        render_empty_state(
+            "Journal is empty",
+            "Generate a prediction and save it from the Predictions page to start tracking performance.",
+        )
         return
 
     missing_id = journal_df["entry_id"].astype(str).str.strip().isin(["", "nan", "None"])
@@ -892,6 +962,7 @@ def _render_journal_page(ctx: AppContext) -> None:
         save_journal(ctx.journal_path, journal_df)
 
     metrics = compute_journal_metrics(journal_df)
+    render_section_heading("Journal KPIs")
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Total picks", metrics["total_picks"])
     m2.metric("Win rate", f"{metrics['win_rate'] * 100:.1f}%")
@@ -899,6 +970,7 @@ def _render_journal_page(ctx: AppContext) -> None:
     m4.metric("Profit/Loss", f"{metrics['profit_units']:.2f}u")
     m5.metric("Avg odds", f"{metrics['avg_odds']:.2f}")
 
+    render_section_heading("Filters & Sorting", "Use filters to isolate specific games, leagues, or status groups.")
     f1, f2, f3 = st.columns(3)
     game_options = ["All"] + sorted(journal_df["game"].dropna().astype(str).unique().tolist())
     status_options = ["All"] + sorted(journal_df["status"].dropna().astype(str).unique().tolist())
@@ -916,7 +988,7 @@ def _render_journal_page(ctx: AppContext) -> None:
         filtered = filtered[filtered["league"] == selected_league]
 
     if filtered.empty:
-        st.info("No entries match the selected filters.")
+        render_empty_state("No entries match these filters", "Try broadening status/game/league filters.")
         return
 
     sort_col = st.selectbox(
@@ -938,7 +1010,9 @@ def _render_journal_page(ctx: AppContext) -> None:
         "profit_units",
         "notes",
     ]
-    st.dataframe(filtered[view_cols], use_container_width=True, hide_index=True)
+    table_view = filtered[view_cols].copy()
+    table_view["status"] = table_view["status"].map(status_label)
+    st.dataframe(_style_status_dataframe(table_view), use_container_width=True, hide_index=True)
 
     settled = filtered[filtered["status"].str.lower().isin(["won", "lost", "push"])].copy()
     if not settled.empty:
@@ -947,6 +1021,7 @@ def _render_journal_page(ctx: AppContext) -> None:
         settled["profit_units"] = pd.to_numeric(settled["profit_units"], errors="coerce").fillna(0.0)
         settled["cumulative_profit"] = settled["profit_units"].cumsum()
         chart_df = settled[["created_at_utc", "cumulative_profit"]].set_index("created_at_utc")
+        render_section_heading("Cumulative Profit")
         st.line_chart(chart_df)
 
     with st.expander("Edit Journal Entries"):
@@ -980,18 +1055,26 @@ def _load_optional_breakdown(path: Path) -> pd.DataFrame:
 
 
 def _render_model_performance_page(ctx: AppContext) -> None:
-    st.markdown("## Model Performance")
-    st.caption("Backtest metrics are shown transparently and should be interpreted as draft-only benchmarks.")
+    render_page_intro(
+        title="Model Performance",
+        subtitle="Backtest metrics are presented transparently and should be interpreted as draft-only benchmarks.",
+        badges=["Chronological validation", "LoL + CS2 sections", "Honest baseline comparisons"],
+        eyebrow="Benchmark Center",
+    )
 
     payload = ctx.metrics_payload
     metrics_by_model = payload.get("metrics_by_model", {})
     if not metrics_by_model:
-        st.warning("Metrics file not found or does not contain model metrics.")
+        render_empty_state(
+            "No metrics payload found",
+            "Check the metrics path in Runtime Settings to populate performance dashboards.",
+        )
         return
 
     primary_model = str(payload.get("primary_model", "unknown")).lower()
     primary_metrics = metrics_by_model.get(primary_model, {})
 
+    render_section_heading("Primary Model Snapshot")
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Primary model", primary_model.upper())
     k2.metric("MAE", f"{_safe_float(primary_metrics.get('mae_minutes'), np.nan):.2f} min")
@@ -1003,6 +1086,7 @@ def _render_model_performance_page(ctx: AppContext) -> None:
 
     tab_lol, tab_cs2 = st.tabs(["League of Legends", "Counter-Strike 2"])
     with tab_lol:
+        render_section_heading("Model Comparison", "Lower MAE/RMSE and higher within-band rates are preferred.")
         rows = []
         for model_name, metrics in metrics_by_model.items():
             rows.append(
@@ -1022,7 +1106,7 @@ def _render_model_performance_page(ctx: AppContext) -> None:
 
         split_info = payload.get("split", {})
         if split_info:
-            st.markdown("#### Chronological Split")
+            render_section_heading("Chronological Split")
             split_df = pd.DataFrame([split_info])
             st.dataframe(split_df, use_container_width=True, hide_index=True)
 
@@ -1047,22 +1131,24 @@ def _render_model_performance_page(ctx: AppContext) -> None:
         )
 
     with tab_cs2:
-        st.markdown(
-            """
-            <div class="app-card">
-                <b>CS2 model panel is ready.</b><br/>
-                Connect a CS2 metrics payload to render the same benchmark structure here.
-            </div>
-            """,
-            unsafe_allow_html=True,
+        render_info_panel(
+            "CS2 panel ready",
+            "Connect a CS2 metrics payload to display the same performance framework on this tab.",
+            tone="warning",
         )
         st.caption("Current backend integration in this app instance points to the LoL model artifact.")
 
 
 def _render_account_page(ctx: AppContext) -> None:
-    st.markdown("## Account / Usage")
+    render_page_intro(
+        title="Account / Usage",
+        subtitle="Manage free prediction allowance, monitor monthly usage, and export account data artifacts.",
+        badges=["Usage controls", "Path visibility", "Journal export"],
+        eyebrow="Account Center",
+    )
     usage = get_usage_snapshot()
 
+    render_section_heading("Usage Overview")
     m1, m2, m3 = st.columns(3)
     m1.metric("Monthly allowance", usage["allowance"])
     m2.metric("Used this month", usage["used"])
@@ -1091,7 +1177,7 @@ def _render_account_page(ctx: AppContext) -> None:
         st.success("Usage counter reset for current month.")
         st.rerun()
 
-    st.markdown("### Data Paths")
+    render_section_heading("Data Paths", "Current app pointers for artifacts and reports.")
     path_df = pd.DataFrame(
         [
             {"artifact_path": str(ctx.artifact_path)},

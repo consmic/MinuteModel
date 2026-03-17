@@ -52,6 +52,11 @@ This is a **draft-only benchmark model** designed to be:
 python -m pip install -r requirements.txt
 ```
 
+### Streamlit Community Cloud note
+
+This repo includes `runtime.txt` with `python-3.11` so cloud deploys use a wheel-friendly Python version for
+`scikit-learn`/`scipy` (avoids source builds that require a Fortran toolchain).
+
 ## Data Assumptions and Schema Handling
 
 Oracle's Elixir files often contain multiple rows per match (player and/or team rows). This project inspects and handles that explicitly.
