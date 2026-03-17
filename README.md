@@ -56,6 +56,8 @@ python -m pip install -r requirements.txt
 
 This repo includes `runtime.txt` with `python-3.11` so cloud deploys use a wheel-friendly Python version for
 `scikit-learn`/`scipy` (avoids source builds that require a Fortran toolchain).
+If Cloud still provisions Python 3.14 for an existing app, this repo also uses `scikit-learn>=1.8.0,<1.9`,
+which has Python 3.14 Linux wheels.
 
 ## Data Assumptions and Schema Handling
 
