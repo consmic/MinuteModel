@@ -125,6 +125,8 @@ def predict_single_draft(
     primary_model = str(artifacts.get("primary_model", "lightgbm")).lower()
     catboost_categorical_cols = artifacts.get("catboost_categorical_cols", []) or []
     catboost_numeric_cols = artifacts.get("catboost_numeric_cols", []) or []
+    quantile_bundle = artifacts.get("quantile_regression", {}) or {}
+    quantile_models = artifacts.get("quantile_models", {}) or {}
     config = artifacts.get("config", {})
     target_unit = str(config.get("target_unit", "seconds")).lower()
     unit_to_seconds = 60.0 if target_unit == "minutes" else 1.0
@@ -150,6 +152,61 @@ def predict_single_draft(
         "predicted_duration_seconds": pred_seconds,
         "predicted_duration_minutes": pred_seconds / 60.0,
     }
+
+    if quantile_bundle.get("enabled") and quantile_models:
+        quantile_levels = sorted(float(level) for level in quantile_bundle.get("quantile_levels", []))
+        quantile_preds_model_unit: Dict[float, float] = {}
+        for alpha in quantile_levels:
+            model_key = str(alpha)
+            quantile_model = quantile_models.get(model_key, quantile_models.get(alpha))
+            if quantile_model is None:
+                continue
+            quantile_preds_model_unit[alpha] = float(quantile_model.predict(transformed)[0])
+
+        if quantile_preds_model_unit:
+            ordered_levels = sorted(quantile_preds_model_unit)
+            ordered_values = np.sort(np.array([quantile_preds_model_unit[level] for level in ordered_levels], dtype=float))
+            quantile_preds_seconds = {
+                level: float(ordered_values[idx] * unit_to_seconds)
+                for idx, level in enumerate(ordered_levels)
+            }
+
+            lower_alpha = float(quantile_bundle.get("lower_quantile", ordered_levels[0]))
+            median_alpha = float(quantile_bundle.get("median_quantile", 0.5))
+            upper_alpha = float(quantile_bundle.get("upper_quantile", ordered_levels[-1]))
+            lower_pred = quantile_preds_seconds.get(lower_alpha, quantile_preds_seconds[ordered_levels[0]])
+            median_pred = quantile_preds_seconds.get(median_alpha, pred_seconds)
+            upper_pred = quantile_preds_seconds.get(upper_alpha, quantile_preds_seconds[ordered_levels[-1]])
+            interval_width_minutes = (upper_pred - lower_pred) / 60.0
+
+            thresholds = quantile_bundle.get("volatility_thresholds_minutes", {}) or {}
+            low_threshold = float(thresholds.get("low", 0.0))
+            high_threshold = float(thresholds.get("high", low_threshold))
+            if interval_width_minutes <= low_threshold:
+                volatility_flag = "low volatility"
+            elif interval_width_minutes <= high_threshold:
+                volatility_flag = "medium volatility"
+            else:
+                volatility_flag = "high volatility"
+
+            response["quantile_predictions"] = {
+                f"predicted_p{int(round(level * 100)):02d}_seconds": value
+                for level, value in quantile_preds_seconds.items()
+            }
+            response["quantile_predictions"].update(
+                {
+                    f"predicted_p{int(round(level * 100)):02d}_minutes": value / 60.0
+                    for level, value in quantile_preds_seconds.items()
+                }
+            )
+            response["quantile_predictions"]["interval_width_seconds"] = upper_pred - lower_pred
+            response["quantile_predictions"]["interval_width_minutes"] = interval_width_minutes
+            response["quantile_predictions"]["volatility_flag"] = volatility_flag
+            response["quantile_predictions"]["default_interval"] = {
+                "lower_quantile": lower_alpha,
+                "median_quantile": median_alpha,
+                "upper_quantile": upper_alpha,
+            }
 
     if include_explanation:
         explanation_feature_names = feature_names if feature_names else list(feature_df.columns)

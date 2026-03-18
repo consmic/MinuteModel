@@ -34,6 +34,7 @@ from .state import (
 )
 from .components import (
     render_empty_state,
+    render_duration_prediction_card,
     render_info_panel,
     render_page_intro,
     render_section_heading,
@@ -72,6 +73,7 @@ __all__ = [
     "team_history_view",
     "validate_draft_inputs",
     "render_empty_state",
+    "render_duration_prediction_card",
     "render_info_panel",
     "render_page_intro",
     "render_section_heading",

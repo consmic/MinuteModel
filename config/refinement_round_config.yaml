@@ -5,7 +5,7 @@ reports_dir: reports
 primary_model: catboost
 use_role_specific_draft_features: true
 use_bag_of_champions_fallback: true
-use_sparse_champion_indicator_features: false
+use_sparse_champion_indicator_features: true
 use_pick_order_champion_features: true
 use_series_game_number_feature: false
 target_unit: seconds
@@ -15,29 +15,17 @@ use_extended_rolling_team_priors: true
 use_draft_summary_features: true
 use_draft_interaction_features: true
 use_draft_conditional_behaviour_features: true
-use_turret_prior_features: false
-use_extended_turret_prior_features: false
 draft_conditional_min_samples: 5
-run_feature_group_ablation: true
-run_refinement_ablation: false
-run_turret_feature_ablation: false
+run_feature_group_ablation: false
+run_refinement_ablation: true
 champion_scaling_method: avg_duration_delta
 champion_scaling_smoothing: true
 champion_scaling_min_samples: 20
 champion_scaling_recency_weighting: false
 champion_scaling_recency_half_life_days: 180
 champion_scaling_patch_aware: true
-run_champion_scaling_ablation: true
+run_champion_scaling_ablation: false
 use_rolling_ckpm_prior: true
-enable_quantile_regression: false
-quantile_levels:
-  - 0.1
-  - 0.5
-  - 0.9
-quantile_enforce_non_crossing: true
-volatility_threshold_quantiles:
-  - 0.33
-  - 0.67
 
 train_fraction: 0.70
 validation_fraction: 0.15

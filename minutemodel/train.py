@@ -25,6 +25,8 @@ from .evaluate import (
     add_duration_bucket,
     benchmarking_table,
     error_breakdown_table,
+    pinball_loss,
+    quantile_interval_metrics_seconds,
     regression_metrics_seconds,
     save_error_bar_plot,
     save_residual_plots,
@@ -243,6 +245,216 @@ def _train_final_catboost(
     )
     final_model.fit(X_train_val_cb, y_train_val, cat_features=cat_feature_indices)
     return final_model
+
+
+def _format_quantile_label(alpha: float) -> str:
+    return f"p{int(round(float(alpha) * 100.0)):02d}"
+
+
+def _sorted_quantile_levels(config: PipelineConfig) -> List[float]:
+    return sorted(float(level) for level in config.quantile_levels)
+
+
+def _enforce_non_crossing(prediction_map: Dict[float, np.ndarray]) -> Dict[float, np.ndarray]:
+    if not prediction_map:
+        return {}
+
+    levels = sorted(prediction_map)
+    stacked = np.column_stack([np.asarray(prediction_map[level], dtype=float) for level in levels])
+    stacked = np.sort(stacked, axis=1)
+    return {level: stacked[:, idx] for idx, level in enumerate(levels)}
+
+
+def _quantile_calibration_rows(
+    y_true_seconds: np.ndarray,
+    prediction_seconds_by_quantile: Dict[float, np.ndarray],
+    split_name: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for alpha in sorted(prediction_seconds_by_quantile):
+        preds = np.asarray(prediction_seconds_by_quantile[alpha], dtype=float)
+        empirical = float(np.mean(np.asarray(y_true_seconds, dtype=float) <= preds))
+        rows.append(
+            {
+                "split": split_name,
+                "quantile": float(alpha),
+                "quantile_label": _format_quantile_label(alpha),
+                "nominal_coverage": float(alpha),
+                "empirical_cdf": empirical,
+                "calibration_error": empirical - float(alpha),
+            }
+        )
+    return rows
+
+
+def _volatility_score(width_minutes: np.ndarray, reference_widths_minutes: np.ndarray) -> np.ndarray:
+    reference = np.sort(np.asarray(reference_widths_minutes, dtype=float))
+    if reference.size == 0:
+        return np.zeros(len(width_minutes), dtype=float)
+
+    clipped = np.asarray(width_minutes, dtype=float)
+    ranks = np.searchsorted(reference, clipped, side="right")
+    return ranks / float(reference.size)
+
+
+def _apply_volatility_labels(
+    width_minutes: np.ndarray,
+    low_threshold_minutes: float,
+    high_threshold_minutes: float,
+) -> List[str]:
+    labels: List[str] = []
+    for width in np.asarray(width_minutes, dtype=float):
+        if width <= low_threshold_minutes:
+            labels.append("low volatility")
+        elif width <= high_threshold_minutes:
+            labels.append("medium volatility")
+        else:
+            labels.append("high volatility")
+    return labels
+
+
+def _build_quantile_prediction_frame(
+    source_df: pd.DataFrame,
+    actual_seconds: np.ndarray,
+    prediction_seconds_by_quantile: Dict[float, np.ndarray],
+    lower_alpha: float,
+    median_alpha: float,
+    upper_alpha: float,
+    reference_widths_minutes: np.ndarray,
+    low_threshold_minutes: float,
+    high_threshold_minutes: float,
+) -> pd.DataFrame:
+    out = source_df[["gameid", "league", "patch", "date"]].copy().reset_index(drop=True)
+    out["actual_duration_seconds"] = np.asarray(actual_seconds, dtype=float)
+    out["actual_duration_minutes"] = out["actual_duration_seconds"] / 60.0
+
+    for alpha in sorted(prediction_seconds_by_quantile):
+        label = _format_quantile_label(alpha)
+        preds = np.asarray(prediction_seconds_by_quantile[alpha], dtype=float)
+        out[f"pred_{label}_seconds"] = preds
+        out[f"pred_{label}_minutes"] = preds / 60.0
+
+    lower_label = _format_quantile_label(lower_alpha)
+    median_label = _format_quantile_label(median_alpha)
+    upper_label = _format_quantile_label(upper_alpha)
+
+    out["interval_width_seconds"] = out[f"pred_{upper_label}_seconds"] - out[f"pred_{lower_label}_seconds"]
+    out["interval_width_minutes"] = out["interval_width_seconds"] / 60.0
+    out["prediction_error_from_p50_seconds"] = out[f"pred_{median_label}_seconds"] - out["actual_duration_seconds"]
+    out["prediction_error_from_p50_minutes"] = out["prediction_error_from_p50_seconds"] / 60.0
+
+    widths_minutes = out["interval_width_minutes"].to_numpy(dtype=float)
+    out["volatility_score"] = _volatility_score(widths_minutes, reference_widths_minutes)
+    out["volatility_flag"] = _apply_volatility_labels(widths_minutes, low_threshold_minutes, high_threshold_minutes)
+    return out
+
+
+def _train_catboost_quantile_suite(
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    X_val: pd.DataFrame,
+    y_val: np.ndarray,
+    X_test: pd.DataFrame,
+    y_test: np.ndarray,
+    X_train_val: pd.DataFrame,
+    y_train_val: np.ndarray,
+    config: PipelineConfig,
+) -> Dict[str, Any]:
+    if CatBoostRegressor is None:
+        raise RuntimeError("CatBoost is not installed. Install `catboost` to use quantile regression.")
+
+    quantile_levels = _sorted_quantile_levels(config)
+    X_train_cb, cat_feature_indices_train, _, _ = _prepare_catboost_frame(X_train)
+    X_val_cb, _, _, _ = _prepare_catboost_frame(X_val)
+    X_test_cb, _, _, _ = _prepare_catboost_frame(X_test)
+    X_train_val_cb, cat_feature_indices_train_val, _, _ = _prepare_catboost_frame(X_train_val)
+
+    val_predictions: Dict[float, np.ndarray] = {}
+    test_predictions: Dict[float, np.ndarray] = {}
+    quantile_models: Dict[str, Any] = {}
+    quantile_params: Dict[str, Dict[str, Any]] = {}
+    quantile_iterations: Dict[str, int] = {}
+    validation_pinball_losses: Dict[str, float] = {}
+
+    for alpha in quantile_levels:
+        quantile_label = _format_quantile_label(alpha)
+        best_loss = float("inf")
+        best_params: Dict[str, Any] = {}
+        best_iteration = 0
+        best_model: Any = None
+        loss_function = f"Quantile:alpha={alpha}"
+
+        for idx, params in enumerate(config.catboost_param_grid):
+            candidate = CatBoostRegressor(
+                loss_function=loss_function,
+                eval_metric=loss_function,
+                iterations=config.catboost_iterations,
+                random_seed=config.random_seed,
+                verbose=False,
+                **params,
+            )
+            candidate.fit(
+                X_train_cb,
+                y_train,
+                cat_features=cat_feature_indices_train,
+                eval_set=(X_val_cb, y_val),
+                use_best_model=True,
+                early_stopping_rounds=config.catboost_early_stopping_rounds,
+            )
+            val_pred = np.asarray(candidate.predict(X_val_cb), dtype=float)
+            val_loss = pinball_loss(y_val, val_pred, alpha)
+            LOGGER.info(
+                "CatBoost quantile candidate %d for %s validation pinball loss (target units): %.4f",
+                idx + 1,
+                quantile_label,
+                val_loss,
+            )
+            if val_loss < best_loss:
+                best_loss = val_loss
+                best_params = dict(params)
+                best_iteration = int(candidate.get_best_iteration())
+                best_model = candidate
+
+        if best_model is None:
+            raise RuntimeError(f"CatBoost quantile tuning failed for quantile {quantile_label}.")
+
+        if best_iteration <= 0:
+            best_iteration = config.catboost_iterations
+
+        final_model = CatBoostRegressor(
+            loss_function=loss_function,
+            eval_metric=loss_function,
+            iterations=max(int(best_iteration), 1),
+            random_seed=config.random_seed,
+            verbose=False,
+            **best_params,
+        )
+        final_model.fit(X_train_val_cb, y_train_val, cat_features=cat_feature_indices_train_val)
+
+        val_predictions[alpha] = np.asarray(best_model.predict(X_val_cb), dtype=float)
+        test_predictions[alpha] = np.asarray(final_model.predict(X_test_cb), dtype=float)
+        quantile_models[str(alpha)] = final_model
+        quantile_params[quantile_label] = best_params
+        quantile_iterations[quantile_label] = int(best_iteration)
+        validation_pinball_losses[quantile_label] = float(best_loss)
+
+    if config.quantile_enforce_non_crossing:
+        val_predictions = _enforce_non_crossing(val_predictions)
+        test_predictions = _enforce_non_crossing(test_predictions)
+
+    return {
+        "quantile_levels": quantile_levels,
+        "val_predictions_model_unit": val_predictions,
+        "test_predictions_model_unit": test_predictions,
+        "models": quantile_models,
+        "best_params_by_quantile": quantile_params,
+        "best_iteration_by_quantile": quantile_iterations,
+        "validation_pinball_loss_by_quantile": validation_pinball_losses,
+        "X_val_transformed": X_val_cb,
+        "X_test_transformed": X_test_cb,
+        "y_val": np.asarray(y_val, dtype=float),
+        "y_test": np.asarray(y_test, dtype=float),
+    }
 
 
 def _save_shap_diagnostics(
@@ -551,6 +763,85 @@ def _feature_group_ablation_configs(base_config: PipelineConfig) -> List[Tuple[s
     return variants
 
 
+def _same_feature_config(left: PipelineConfig, right: PipelineConfig) -> bool:
+    return (
+        left.use_extended_rolling_team_priors == right.use_extended_rolling_team_priors
+        and left.use_draft_summary_features == right.use_draft_summary_features
+        and left.use_draft_interaction_features == right.use_draft_interaction_features
+        and left.use_draft_conditional_behaviour_features == right.use_draft_conditional_behaviour_features
+        and left.use_turret_prior_features == right.use_turret_prior_features
+        and left.use_extended_turret_prior_features == right.use_extended_turret_prior_features
+        and left.use_champion_scaling_features == right.use_champion_scaling_features
+        and left.use_sparse_champion_indicator_features == right.use_sparse_champion_indicator_features
+        and left.use_pick_order_champion_features == right.use_pick_order_champion_features
+        and left.use_series_game_number_feature == right.use_series_game_number_feature
+        and left.use_role_specific_draft_features == right.use_role_specific_draft_features
+        and left.use_bag_of_champions_fallback == right.use_bag_of_champions_fallback
+    )
+
+
+def _refinement_ablation_configs(base_config: PipelineConfig) -> List[Tuple[str, PipelineConfig]]:
+    variants = [
+        ("A_current_best", base_config),
+        (
+            "B_plus_game",
+            replace(base_config, use_series_game_number_feature=True),
+        ),
+        (
+            "C_minus_sparse_indicators",
+            replace(base_config, use_sparse_champion_indicator_features=False),
+        ),
+        (
+            "D_plus_game_minus_sparse_indicators",
+            replace(
+                base_config,
+                use_series_game_number_feature=True,
+                use_sparse_champion_indicator_features=False,
+            ),
+        ),
+        (
+            "E_plus_game_role_slots_only",
+            replace(
+                base_config,
+                use_series_game_number_feature=True,
+                use_sparse_champion_indicator_features=False,
+                use_pick_order_champion_features=False,
+            ),
+        ),
+    ]
+    return variants
+
+
+def _turret_feature_ablation_configs(base_config: PipelineConfig) -> List[Tuple[str, PipelineConfig]]:
+    variants = [
+        (
+            "A_current_preferred",
+            replace(
+                base_config,
+                use_turret_prior_features=False,
+                use_extended_turret_prior_features=False,
+            ),
+        ),
+        (
+            "B_plus_core_turret_priors",
+            replace(
+                base_config,
+                use_turret_prior_features=True,
+                use_extended_turret_prior_features=False,
+            ),
+        ),
+        (
+            "C_plus_full_turret_priors",
+            replace(
+                base_config,
+                use_turret_prior_features=True,
+                use_extended_turret_prior_features=True,
+            ),
+        ),
+    ]
+    return variants
+
+
 def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
     config.validate()
     seed_everything(config.random_seed)
@@ -571,31 +862,218 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
     match_df = build_leakage_safe_rolling_priors(match_df, config=config)
 
     split = chronological_split(match_df, config)
-    if config.primary_model == "catboost":
-        main_run = _train_catboost_variant(split=split, config=config)
-    else:
-        main_run = _train_lightgbm_variant(split=split, config=config)
+    variant_train_fn = _train_catboost_variant if config.primary_model == "catboost" else _train_lightgbm_variant
+    main_run = variant_train_fn(split=split, config=config)
+    selected_run = main_run
+    selected_config = config
+    selected_variant_label = "A_current_best"
 
-    primary_model_name: str = main_run["model_name"]
-    feature_builder: DraftFeatureBuilder = main_run["feature_builder"]
-    categorical_cols: List[str] = main_run["categorical_cols"]
-    numeric_cols: List[str] = main_run["numeric_cols"]
-    X_train: pd.DataFrame = main_run["X_train"]
-    X_val: pd.DataFrame = main_run["X_val"]
-    X_test: pd.DataFrame = main_run["X_test"]
-    y_train: np.ndarray = main_run["y_train"]
-    y_val: np.ndarray = main_run["y_val"]
-    y_test_seconds: np.ndarray = main_run["y_test_seconds"]
-    unit_to_seconds: float = main_run["unit_to_seconds"]
-    X_train_val: pd.DataFrame = main_run["X_train_val"]
-    y_train_val: np.ndarray = main_run["y_train_val"]
-    preprocessor_final = main_run["preprocessor_final"]
-    X_test_transformed = main_run["X_test_transformed"]
-    final_primary_model = main_run["model"]
-    best_params: Dict[str, float] = main_run["best_params"]
-    best_val_mae_seconds: float = main_run["best_val_mae_seconds"]
-    feature_names: List[str] = main_run["feature_names"]
-    primary_preds_model_unit: np.ndarray = main_run["preds_model_unit"]
+    refinement_ablation_payload: Dict[str, Any] = {"enabled": False}
+    refinement_ablation_csv_path: Path | None = None
+    refinement_ablation_json_path: Path | None = None
+    if config.run_refinement_ablation:
+        refinement_variants = _refinement_ablation_configs(config)
+        refinement_runs: Dict[str, Dict[str, Any]] = {}
+        refinement_variant_configs: Dict[str, PipelineConfig] = {}
+        refinement_rows: List[Dict[str, Any]] = []
+
+        for label, variant_cfg in refinement_variants:
+            LOGGER.info(
+                "Running refinement variant=%s (game=%s, sparse_indicators=%s, pick_order_slots=%s)",
+                label,
+                variant_cfg.use_series_game_number_feature,
+                variant_cfg.use_sparse_champion_indicator_features,
+                variant_cfg.use_pick_order_champion_features,
+            )
+            variant_run = main_run if _same_feature_config(variant_cfg, config) else variant_train_fn(split=split, config=variant_cfg)
+            refinement_runs[label] = variant_run
+            refinement_variant_configs[label] = variant_cfg
+
+            row = {
+                "variant": label,
+                "use_series_game_number_feature": bool(variant_cfg.use_series_game_number_feature),
+                "use_sparse_champion_indicator_features": bool(variant_cfg.use_sparse_champion_indicator_features),
+                "use_pick_order_champion_features": bool(variant_cfg.use_pick_order_champion_features),
+                "feature_count": int(len(variant_run["feature_names"])),
+            }
+            row.update(variant_run["metrics"])
+            refinement_rows.append(row)
+
+        refinement_df = pd.DataFrame(refinement_rows).sort_values("mae_minutes").reset_index(drop=True)
+        best_row = refinement_df.iloc[0]
+        selected_variant_label = str(best_row["variant"])
+        selected_run = refinement_runs[selected_variant_label]
+        selected_config = refinement_variant_configs[selected_variant_label]
+
+        baseline_row = refinement_df.loc[refinement_df["variant"] == "A_current_best"].iloc[0]
+        refinement_df["mae_minutes_delta_vs_A"] = refinement_df["mae_minutes"] - float(baseline_row["mae_minutes"])
+        refinement_df["rmse_minutes_delta_vs_A"] = refinement_df["rmse_minutes"] - float(baseline_row["rmse_minutes"])
+        refinement_df["median_absolute_error_minutes_delta_vs_A"] = (
+            refinement_df["median_absolute_error_minutes"] - float(baseline_row["median_absolute_error_minutes"])
+        )
+        refinement_df["within_2_minutes_accuracy_delta_vs_A"] = (
+            refinement_df["within_2_minutes_accuracy"] - float(baseline_row["within_2_minutes_accuracy"])
+        )
+        refinement_df["within_5_minutes_accuracy_delta_vs_A"] = (
+            refinement_df["within_5_minutes_accuracy"] - float(baseline_row["within_5_minutes_accuracy"])
+        )
+
+        refinement_ablation_csv_path = Path(reports_dir) / "refinement_ablation.csv"
+        refinement_df.to_csv(refinement_ablation_csv_path, index=False)
+        refinement_ablation_json_path = Path(reports_dir) / "refinement_ablation.json"
+        write_json(
+            {
+                "best_variant": selected_variant_label,
+                "best_variant_config": {
+                    "use_series_game_number_feature": bool(selected_config.use_series_game_number_feature),
+                    "use_sparse_champion_indicator_features": bool(selected_config.use_sparse_champion_indicator_features),
+                    "use_pick_order_champion_features": bool(selected_config.use_pick_order_champion_features),
+                },
+                "variants": refinement_rows,
+            },
+            refinement_ablation_json_path,
+        )
+        LOGGER.info("Saved refinement ablation to %s and %s", refinement_ablation_csv_path, refinement_ablation_json_path)
+
+        refinement_ablation_payload = {
+            "enabled": True,
+            "best_variant": selected_variant_label,
+            "ablation_csv": str(refinement_ablation_csv_path),
+            "ablation_json": str(refinement_ablation_json_path),
+        }
+
+    turret_feature_ablation_payload: Dict[str, Any] = {"enabled": False}
+    turret_feature_ablation_csv_path: Path | None = None
+    turret_feature_ablation_json_path: Path | None = None
+    turret_feature_summary_path: Path | None = None
+    if config.run_turret_feature_ablation:
+        turret_variants = _turret_feature_ablation_configs(selected_config)
+        turret_runs: Dict[str, Dict[str, Any]] = {}
+        turret_variant_configs: Dict[str, PipelineConfig] = {}
+        turret_rows: List[Dict[str, Any]] = []
+
+        for label, variant_cfg in turret_variants:
+            LOGGER.info(
+                "Running turret-feature variant=%s (turret=%s, extended_turret=%s)",
+                label,
+                variant_cfg.use_turret_prior_features,
+                variant_cfg.use_extended_turret_prior_features,
+            )
+            variant_run = (
+                selected_run
+                if _same_feature_config(variant_cfg, selected_config)
+                else variant_train_fn(split=split, config=variant_cfg)
+            )
+            turret_runs[label] = variant_run
+            turret_variant_configs[label] = variant_cfg
+
+            row = {
+                "variant": label,
+                "use_turret_prior_features": bool(variant_cfg.use_turret_prior_features),
+                "use_extended_turret_prior_features": bool(variant_cfg.use_extended_turret_prior_features),
+                "feature_count": int(len(variant_run["feature_names"])),
+            }
+            row.update(variant_run["metrics"])
+            turret_rows.append(row)
+
+        turret_df = pd.DataFrame(turret_rows).sort_values("mae_minutes").reset_index(drop=True)
+        best_row = turret_df.iloc[0]
+        selected_variant_label = str(best_row["variant"])
+        selected_run = turret_runs[selected_variant_label]
+        selected_config = turret_variant_configs[selected_variant_label]
+
+        baseline_row = turret_df.loc[turret_df["variant"] == "A_current_preferred"].iloc[0]
+        turret_df["mae_minutes_delta_vs_A"] = turret_df["mae_minutes"] - float(baseline_row["mae_minutes"])
+        turret_df["rmse_minutes_delta_vs_A"] = turret_df["rmse_minutes"] - float(baseline_row["rmse_minutes"])
+        turret_df["median_absolute_error_minutes_delta_vs_A"] = (
+            turret_df["median_absolute_error_minutes"] - float(baseline_row["median_absolute_error_minutes"])
+        )
+        turret_df["within_2_minutes_accuracy_delta_vs_A"] = (
+            turret_df["within_2_minutes_accuracy"] - float(baseline_row["within_2_minutes_accuracy"])
+        )
+        turret_df["within_5_minutes_accuracy_delta_vs_A"] = (
+            turret_df["within_5_minutes_accuracy"] - float(baseline_row["within_5_minutes_accuracy"])
+        )
+
+        turret_feature_ablation_csv_path = Path(reports_dir) / "turret_feature_ablation.csv"
+        turret_df.to_csv(turret_feature_ablation_csv_path, index=False)
+        turret_feature_ablation_json_path = Path(reports_dir) / "turret_feature_ablation.json"
+        write_json(
+            {
+                "best_variant": selected_variant_label,
+                "best_variant_config": {
+                    "use_turret_prior_features": bool(selected_config.use_turret_prior_features),
+                    "use_extended_turret_prior_features": bool(selected_config.use_extended_turret_prior_features),
+                },
+                "source_columns_available": [
+                    "firsttower",
+                    "towers",
+                    "opp_towers",
+                    "firstmidtower",
+                    "firsttothreetowers",
+                ],
+                "timed_turret_columns_available": [],
+                "variants": turret_rows,
+            },
+            turret_feature_ablation_json_path,
+        )
+
+        summary_lines = [
+            "# Turret Feature Summary",
+            "",
+            "Added leakage-safe historical turret priors using only prior matches.",
+            "",
+            "Available source columns:",
+            "- `firsttower`",
+            "- `towers`",
+            "- `opp_towers`",
+            "- `firstmidtower`",
+            "- `firsttothreetowers`",
+            "",
+            "Unavailable timed turret sources:",
+            "- no `turretdiffat15` / `towersat15` / `time_to_first_turret` style columns were found",
+            "",
+            f"Best variant: `{selected_variant_label}`",
+            f"- use_turret_prior_features: `{selected_config.use_turret_prior_features}`",
+            f"- use_extended_turret_prior_features: `{selected_config.use_extended_turret_prior_features}`",
+        ]
+        turret_feature_summary_path = Path(reports_dir) / "turret_feature_summary.md"
+        turret_feature_summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+
+        LOGGER.info(
+            "Saved turret feature ablation to %s and %s",
+            turret_feature_ablation_csv_path,
+            turret_feature_ablation_json_path,
+        )
+        turret_feature_ablation_payload = {
+            "enabled": True,
+            "best_variant": selected_variant_label,
+            "ablation_csv": str(turret_feature_ablation_csv_path),
+            "ablation_json": str(turret_feature_ablation_json_path),
+            "summary_markdown": str(turret_feature_summary_path),
+        }
+
+    primary_model_name: str = selected_run["model_name"]
+    feature_builder: DraftFeatureBuilder = selected_run["feature_builder"]
+    categorical_cols: List[str] = selected_run["categorical_cols"]
+    numeric_cols: List[str] = selected_run["numeric_cols"]
+    X_train: pd.DataFrame = selected_run["X_train"]
+    X_val: pd.DataFrame = selected_run["X_val"]
+    X_test: pd.DataFrame = selected_run["X_test"]
+    y_train: np.ndarray = selected_run["y_train"]
+    y_val: np.ndarray = selected_run["y_val"]
+    y_test: np.ndarray = selected_run["y_test"]
+    y_test_seconds: np.ndarray = selected_run["y_test_seconds"]
+    unit_to_seconds: float = selected_run["unit_to_seconds"]
+    X_train_val: pd.DataFrame = selected_run["X_train_val"]
+    y_train_val: np.ndarray = selected_run["y_train_val"]
+    preprocessor_final = selected_run["preprocessor_final"]
+    X_test_transformed = selected_run["X_test_transformed"]
+    final_primary_model = selected_run["model"]
+    best_params: Dict[str, float] = selected_run["best_params"]
+    best_val_mae_seconds: float = selected_run["best_val_mae_seconds"]
+    feature_names: List[str] = selected_run["feature_names"]
+    primary_preds_model_unit: np.ndarray = selected_run["preds_model_unit"]
 
     _save_feature_column_artifacts(
         reports_dir=reports_dir,
@@ -603,6 +1081,199 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
         numeric_cols=numeric_cols,
         transformed_feature_names=feature_names,
     )
+
+    quantile_payload: Dict[str, Any] = {"enabled": False}
+    quantile_models: Dict[str, Any] = {}
+    quantile_prediction_paths: Dict[str, str] = {}
+    quantile_metrics_summary_path: Path | None = None
+    quantile_comparison_path: Path | None = None
+    quantile_diagnostics_path: Path | None = None
+    if selected_config.enable_quantile_regression:
+        quantile_run = _train_catboost_quantile_suite(
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            y_val=y_val,
+            X_test=X_test,
+            y_test=y_test,
+            X_train_val=X_train_val,
+            y_train_val=y_train_val,
+            config=selected_config,
+        )
+
+        quantile_levels = quantile_run["quantile_levels"]
+        lower_alpha = float(quantile_levels[0])
+        median_alpha = 0.5
+        upper_alpha = float(quantile_levels[-1])
+
+        val_prediction_seconds = {
+            alpha: np.asarray(preds, dtype=float) * unit_to_seconds
+            for alpha, preds in quantile_run["val_predictions_model_unit"].items()
+        }
+        test_prediction_seconds = {
+            alpha: np.asarray(preds, dtype=float) * unit_to_seconds
+            for alpha, preds in quantile_run["test_predictions_model_unit"].items()
+        }
+        y_val_seconds = np.asarray(y_val, dtype=float) * unit_to_seconds
+
+        val_width_minutes = (val_prediction_seconds[upper_alpha] - val_prediction_seconds[lower_alpha]) / 60.0
+        low_q, high_q = [float(level) for level in selected_config.volatility_threshold_quantiles]
+        low_threshold_minutes, high_threshold_minutes = np.quantile(val_width_minutes, [low_q, high_q]).tolist()
+
+        quantile_val_metrics = quantile_interval_metrics_seconds(
+            y_true_sec=y_val_seconds,
+            y_pred_p50_sec=val_prediction_seconds[median_alpha],
+            y_pred_lower_sec=val_prediction_seconds[lower_alpha],
+            y_pred_upper_sec=val_prediction_seconds[upper_alpha],
+            lower_alpha=lower_alpha,
+            upper_alpha=upper_alpha,
+        )
+        quantile_test_metrics = quantile_interval_metrics_seconds(
+            y_true_sec=y_test_seconds,
+            y_pred_p50_sec=test_prediction_seconds[median_alpha],
+            y_pred_lower_sec=test_prediction_seconds[lower_alpha],
+            y_pred_upper_sec=test_prediction_seconds[upper_alpha],
+            lower_alpha=lower_alpha,
+            upper_alpha=upper_alpha,
+        )
+
+        val_prediction_frame = _build_quantile_prediction_frame(
+            source_df=split.validation,
+            actual_seconds=y_val_seconds,
+            prediction_seconds_by_quantile=val_prediction_seconds,
+            lower_alpha=lower_alpha,
+            median_alpha=median_alpha,
+            upper_alpha=upper_alpha,
+            reference_widths_minutes=val_width_minutes,
+            low_threshold_minutes=float(low_threshold_minutes),
+            high_threshold_minutes=float(high_threshold_minutes),
+        )
+        test_prediction_frame = _build_quantile_prediction_frame(
+            source_df=split.test,
+            actual_seconds=y_test_seconds,
+            prediction_seconds_by_quantile=test_prediction_seconds,
+            lower_alpha=lower_alpha,
+            median_alpha=median_alpha,
+            upper_alpha=upper_alpha,
+            reference_widths_minutes=val_width_minutes,
+            low_threshold_minutes=float(low_threshold_minutes),
+            high_threshold_minutes=float(high_threshold_minutes),
+        )
+
+        val_predictions_path = Path(reports_dir) / "quantile_predictions_val.csv"
+        test_predictions_path = Path(reports_dir) / "quantile_predictions_test.csv"
+        val_prediction_frame.to_csv(val_predictions_path, index=False)
+        test_prediction_frame.to_csv(test_predictions_path, index=False)
+
+        calibration_rows = _quantile_calibration_rows(y_val_seconds, val_prediction_seconds, "validation")
+        calibration_rows.extend(_quantile_calibration_rows(y_test_seconds, test_prediction_seconds, "test"))
+
+        quantile_metrics_summary_path = Path(reports_dir) / "quantile_metrics_summary.json"
+        write_json(
+            {
+                "quantile_levels": quantile_levels,
+                "lower_quantile": lower_alpha,
+                "median_quantile": median_alpha,
+                "upper_quantile": upper_alpha,
+                "validation_metrics": quantile_val_metrics,
+                "test_metrics": quantile_test_metrics,
+                "validation_pinball_loss_by_quantile": quantile_run["validation_pinball_loss_by_quantile"],
+                "volatility_threshold_quantiles": selected_config.volatility_threshold_quantiles,
+                "volatility_thresholds_minutes": {
+                    "low": float(low_threshold_minutes),
+                    "high": float(high_threshold_minutes),
+                },
+                "prediction_tables": {
+                    "validation": str(val_predictions_path),
+                    "test": str(test_predictions_path),
+                },
+            },
+            quantile_metrics_summary_path,
+        )
+
+        point_metrics = selected_run["metrics"]
+        quantile_comparison_path = Path(reports_dir) / "quantile_vs_point_comparison.json"
+        write_json(
+            {
+                "point_model_name": primary_model_name,
+                "point_model_test_metrics": point_metrics,
+                "quantile_p50_test_metrics": {
+                    "mae_minutes": quantile_test_metrics["mae_minutes"],
+                    "rmse_minutes": quantile_test_metrics["rmse_minutes"],
+                    "median_absolute_error_minutes": quantile_test_metrics["median_absolute_error_minutes"],
+                    "within_2_minutes_accuracy": quantile_test_metrics["within_2_minutes_accuracy"],
+                    "within_5_minutes_accuracy": quantile_test_metrics["within_5_minutes_accuracy"],
+                    "mae_seconds": quantile_test_metrics["mae_seconds"],
+                },
+                "delta_p50_minus_point": {
+                    "mae_minutes": quantile_test_metrics["mae_minutes"] - point_metrics["mae_minutes"],
+                    "rmse_minutes": quantile_test_metrics["rmse_minutes"] - point_metrics["rmse_minutes"],
+                    "median_absolute_error_minutes": (
+                        quantile_test_metrics["median_absolute_error_minutes"]
+                        - point_metrics["median_absolute_error_minutes"]
+                    ),
+                    "within_2_minutes_accuracy": (
+                        quantile_test_metrics["within_2_minutes_accuracy"]
+                        - point_metrics["within_2_minutes_accuracy"]
+                    ),
+                    "within_5_minutes_accuracy": (
+                        quantile_test_metrics["within_5_minutes_accuracy"]
+                        - point_metrics["within_5_minutes_accuracy"]
+                    ),
+                },
+                "interval_summary": {
+                    "average_interval_width_minutes": quantile_test_metrics["average_interval_width_minutes"],
+                    "median_interval_width_minutes": quantile_test_metrics["median_interval_width_minutes"],
+                    "interval_coverage": quantile_test_metrics["interval_coverage"],
+                    "undercoverage_rate": quantile_test_metrics["undercoverage_rate"],
+                    "overcoverage_rate": quantile_test_metrics["overcoverage_rate"],
+                },
+            },
+            quantile_comparison_path,
+        )
+
+        quantile_diagnostics_path = Path(reports_dir) / "quantile_interval_diagnostics.json"
+        write_json(
+            {
+                "quantile_levels": quantile_levels,
+                "calibration_rows": calibration_rows,
+                "validation_width_minutes_summary": {
+                    "mean": float(np.mean(val_prediction_frame["interval_width_minutes"])),
+                    "median": float(np.median(val_prediction_frame["interval_width_minutes"])),
+                },
+                "test_width_minutes_summary": {
+                    "mean": float(np.mean(test_prediction_frame["interval_width_minutes"])),
+                    "median": float(np.median(test_prediction_frame["interval_width_minutes"])),
+                },
+                "volatility_bucket_counts": {
+                    "validation": val_prediction_frame["volatility_flag"].value_counts().to_dict(),
+                    "test": test_prediction_frame["volatility_flag"].value_counts().to_dict(),
+                },
+            },
+            quantile_diagnostics_path,
+        )
+
+        quantile_models = quantile_run["models"]
+        quantile_prediction_paths = {
+            "validation": str(val_predictions_path),
+            "test": str(test_predictions_path),
+        }
+        quantile_payload = {
+            "enabled": True,
+            "quantile_levels": quantile_levels,
+            "lower_quantile": lower_alpha,
+            "median_quantile": median_alpha,
+            "upper_quantile": upper_alpha,
+            "metrics_summary_json": str(quantile_metrics_summary_path),
+            "comparison_json": str(quantile_comparison_path),
+            "diagnostics_json": str(quantile_diagnostics_path),
+            "prediction_tables": quantile_prediction_paths,
+            "volatility_thresholds_minutes": {
+                "low": float(low_threshold_minutes),
+                "high": float(high_threshold_minutes),
+            },
+        }
+        LOGGER.info("Saved quantile regression artifacts to %s", reports_dir)
 
     # Baselines (trained on train+val where no tuning is required).
     global_mean_value = float(np.mean(y_train_val))
@@ -703,13 +1374,7 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
                 variant_cfg.use_draft_interaction_features,
                 variant_cfg.use_draft_conditional_behaviour_features,
             )
-            same_as_main = (
-                variant_cfg.use_extended_rolling_team_priors == config.use_extended_rolling_team_priors
-                and variant_cfg.use_draft_summary_features == config.use_draft_summary_features
-                and variant_cfg.use_draft_interaction_features == config.use_draft_interaction_features
-                and variant_cfg.use_draft_conditional_behaviour_features == config.use_draft_conditional_behaviour_features
-                and variant_cfg.use_champion_scaling_features == config.use_champion_scaling_features
-            )
+            same_as_main = _same_feature_config(variant_cfg, config)
             variant_run = main_run if same_as_main else variant_train_fn(split=split, config=variant_cfg)
             variant_metrics[label] = variant_run["metrics"]
             variant_feature_counts[label] = int(len(variant_run["feature_names"]))
@@ -811,7 +1476,7 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
         "ridge_alpha": best_alpha,
         "global_mean_baseline": global_mean_value * unit_to_seconds,
         "schema_report": schema_report.to_dict(),
-        "config": config.to_dict(),
+        "config": selected_config.to_dict(),
         "feature_names": feature_names,
         "input_feature_columns_csv": str(Path(reports_dir) / "model_input_feature_columns.csv"),
         "transformed_feature_columns_csv": str(Path(reports_dir) / "transformed_feature_columns.csv"),
@@ -822,16 +1487,27 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
     if primary_model_name == "catboost":
         model_payload["best_catboost_params"] = best_params
         model_payload["best_catboost_validation_mae_seconds"] = best_val_mae_seconds
-        if "best_iteration" in main_run:
-            model_payload["best_catboost_iteration"] = int(main_run["best_iteration"])
-        model_payload["catboost_categorical_cols"] = main_run.get("catboost_categorical_cols", [])
-        model_payload["catboost_numeric_cols"] = main_run.get("catboost_numeric_cols", [])
+        if "best_iteration" in selected_run:
+            model_payload["best_catboost_iteration"] = int(selected_run["best_iteration"])
+        model_payload["catboost_categorical_cols"] = selected_run.get("catboost_categorical_cols", [])
+        model_payload["catboost_numeric_cols"] = selected_run.get("catboost_numeric_cols", [])
     if champion_scaling_lookup_path:
         model_payload["champion_scaling_lookup_csv"] = champion_scaling_lookup_path
     if champion_scaling_lookup_artifact_path:
         model_payload["champion_scaling_lookup_artifact"] = champion_scaling_lookup_artifact_path
     if catboost_feature_importance_path:
         model_payload["catboost_feature_importance_csv"] = catboost_feature_importance_path
+    if quantile_payload["enabled"]:
+        model_payload["quantile_regression"] = {
+            "enabled": True,
+            "quantile_levels": quantile_payload["quantile_levels"],
+            "lower_quantile": quantile_payload["lower_quantile"],
+            "median_quantile": quantile_payload["median_quantile"],
+            "upper_quantile": quantile_payload["upper_quantile"],
+            "prediction_tables": quantile_prediction_paths,
+            "volatility_thresholds_minutes": quantile_payload["volatility_thresholds_minutes"],
+        }
+        model_payload["quantile_models"] = quantile_models
 
     joblib.dump(model_payload, Path(output_dir) / "model_artifacts.joblib")
     LOGGER.info("Saved model artifacts.")
@@ -852,14 +1528,18 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
 
     write_json(
         {
+            "selected_variant": selected_variant_label,
             "primary_model": primary_model_name,
             "metrics_by_model": metrics_by_model,
             "primary_model_best_params": best_params,
             "primary_model_validation_mae_seconds": best_val_mae_seconds,
             "ridge_alpha": best_alpha,
             "split": split_summary,
+            "refinement_ablation": refinement_ablation_payload,
+            "turret_feature_ablation": turret_feature_ablation_payload,
             "champion_scaling_ablation": champion_scaling_ablation_payload,
             "feature_group_ablation": feature_group_ablation_payload,
+            "quantile_regression": quantile_payload,
         },
         Path(reports_dir) / "metrics_summary.json",
     )
@@ -869,12 +1549,20 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
     LOGGER.info("Saved match-level table CSV.")
 
     return {
+        "selected_variant": selected_variant_label,
         "primary_model": primary_model_name,
         "metrics_by_model": metrics_by_model,
         "benchmark_csv": str(benchmark_path),
+        "refinement_ablation_csv": str(refinement_ablation_csv_path) if refinement_ablation_csv_path else None,
+        "refinement_ablation_json": str(refinement_ablation_json_path) if refinement_ablation_json_path else None,
+        "turret_feature_ablation_csv": str(turret_feature_ablation_csv_path) if turret_feature_ablation_csv_path else None,
+        "turret_feature_ablation_json": str(turret_feature_ablation_json_path) if turret_feature_ablation_json_path else None,
         "champion_scaling_ablation_csv": str(champion_scaling_ablation_path) if champion_scaling_ablation_path else None,
         "feature_group_ablation_csv": str(feature_group_ablation_csv_path) if feature_group_ablation_csv_path else None,
         "feature_group_ablation_json": str(feature_group_ablation_json_path) if feature_group_ablation_json_path else None,
+        "quantile_metrics_summary_json": str(quantile_metrics_summary_path) if quantile_metrics_summary_path else None,
+        "quantile_vs_point_comparison_json": str(quantile_comparison_path) if quantile_comparison_path else None,
+        "quantile_interval_diagnostics_json": str(quantile_diagnostics_path) if quantile_diagnostics_path else None,
         "catboost_feature_importance_csv": catboost_feature_importance_path,
         "artifacts_path": str(Path(output_dir) / "model_artifacts.joblib"),
         "reports_dir": str(reports_dir),

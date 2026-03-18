@@ -23,6 +23,11 @@ TEAM_HISTORY_SOURCE_COLUMNS = [
     "firstbaron",
     "barons",
     "golddiffat15",
+    "firsttower",
+    "firstmidtower",
+    "firsttothreetowers",
+    "towers",
+    "opp_towers",
 ]
 MATCH_META_COLUMNS = ["league", "year", "split", "playoffs", "date", "patch", "game", "url"]
 
@@ -210,6 +215,11 @@ def flatten_to_match_level(df: pd.DataFrame, config: PipelineConfig, target_unit
             "blue_firstbaron_source": blue_payload.get("firstbaron"),
             "blue_barons_source": blue_payload.get("barons"),
             "blue_golddiffat15_source": blue_payload.get("golddiffat15"),
+            "blue_firsttower_source": blue_payload.get("firsttower"),
+            "blue_firstmidtower_source": blue_payload.get("firstmidtower"),
+            "blue_firsttothreetowers_source": blue_payload.get("firsttothreetowers"),
+            "blue_towers_source": blue_payload.get("towers"),
+            "blue_opp_towers_source": blue_payload.get("opp_towers"),
             "red_team_id": red_payload.get("teamid"),
             "red_team_name": red_payload.get("teamname"),
             "red_first_pick": red_payload.get("firstPick"),
@@ -223,6 +233,11 @@ def flatten_to_match_level(df: pd.DataFrame, config: PipelineConfig, target_unit
             "red_firstbaron_source": red_payload.get("firstbaron"),
             "red_barons_source": red_payload.get("barons"),
             "red_golddiffat15_source": red_payload.get("golddiffat15"),
+            "red_firsttower_source": red_payload.get("firsttower"),
+            "red_firstmidtower_source": red_payload.get("firstmidtower"),
+            "red_firsttothreetowers_source": red_payload.get("firsttothreetowers"),
+            "red_towers_source": red_payload.get("towers"),
+            "red_opp_towers_source": red_payload.get("opp_towers"),
             "target_gamelength_seconds": gamelength_seconds,
             "target_gamelength_minutes": gamelength_seconds / 60.0,
         }

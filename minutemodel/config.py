@@ -14,6 +14,7 @@ ALLOWED_METADATA_COLUMNS: List[str] = [
     "split",
     "playoffs",
     "date",
+    "game",
     "patch",
     "side",
     "teamname",
@@ -50,13 +51,17 @@ HISTORICAL_PRIOR_SOURCE_COLUMNS: List[str] = [
     "firstbaron",
     "barons",
     "golddiffat15",
+    "firsttower",
+    "firstmidtower",
+    "firsttothreetowers",
+    "towers",
+    "opp_towers",
 ]
 
 IDENTIFIER_COLUMNS: List[str] = [
     "participantid",
     "datacompleteness",
     "url",
-    "game",
     "playername",
     "playerid",
 ]
@@ -148,6 +153,9 @@ class PipelineConfig:
     primary_model: str = "catboost"
     use_role_specific_draft_features: bool = True
     use_bag_of_champions_fallback: bool = True
+    use_sparse_champion_indicator_features: bool = True
+    use_pick_order_champion_features: bool = True
+    use_series_game_number_feature: bool = False
     target_unit: str = "seconds"
     rolling_window_size: int = 10
     use_champion_scaling_features: bool = False
@@ -155,8 +163,12 @@ class PipelineConfig:
     use_draft_summary_features: bool = True
     use_draft_interaction_features: bool = True
     use_draft_conditional_behaviour_features: bool = True
+    use_turret_prior_features: bool = False
+    use_extended_turret_prior_features: bool = False
     draft_conditional_min_samples: int = 5
     run_feature_group_ablation: bool = True
+    run_refinement_ablation: bool = False
+    run_turret_feature_ablation: bool = False
     champion_scaling_method: str = "avg_duration_delta"
     champion_scaling_smoothing: bool = True
     champion_scaling_min_samples: int = 20
@@ -165,6 +177,10 @@ class PipelineConfig:
     champion_scaling_patch_aware: bool = True
     run_champion_scaling_ablation: bool = True
     use_rolling_ckpm_prior: bool = True
+    enable_quantile_regression: bool = False
+    quantile_levels: List[float] = field(default_factory=lambda: [0.1, 0.5, 0.9])
+    quantile_enforce_non_crossing: bool = True
+    volatility_threshold_quantiles: List[float] = field(default_factory=lambda: [0.33, 0.67])
 
     train_fraction: float = 0.70
     validation_fraction: float = 0.15
@@ -269,6 +285,26 @@ class PipelineConfig:
             raise ValueError("champion_scaling_recency_half_life_days must be >= 1.")
         if self.draft_conditional_min_samples < 1:
             raise ValueError("draft_conditional_min_samples must be >= 1.")
+        if self.use_extended_turret_prior_features and not self.use_turret_prior_features:
+            raise ValueError("use_extended_turret_prior_features requires use_turret_prior_features=True.")
+        if self.enable_quantile_regression and self.primary_model != "catboost":
+            raise ValueError("Quantile regression currently supports only primary_model='catboost'.")
+
+        quantile_levels = [float(level) for level in self.quantile_levels]
+        if not quantile_levels:
+            raise ValueError("quantile_levels must contain at least one quantile.")
+        if any(level <= 0.0 or level >= 1.0 for level in quantile_levels):
+            raise ValueError("quantile_levels must be strictly between 0 and 1.")
+        if len(set(quantile_levels)) != len(quantile_levels):
+            raise ValueError("quantile_levels must not contain duplicates.")
+        if 0.5 not in quantile_levels:
+            raise ValueError("quantile_levels must include 0.5 so p50 can be evaluated against the point model.")
+
+        if len(self.volatility_threshold_quantiles) != 2:
+            raise ValueError("volatility_threshold_quantiles must contain exactly two values.")
+        low_q, high_q = [float(level) for level in self.volatility_threshold_quantiles]
+        if not (0.0 < low_q < high_q < 1.0):
+            raise ValueError("volatility_threshold_quantiles must satisfy 0 < low < high < 1.")
 
 
 def is_forbidden_feature_column(column_name: str) -> bool:

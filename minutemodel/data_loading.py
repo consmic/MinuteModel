@@ -100,6 +100,11 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
         "firstbaron",
         "barons",
         "golddiffat15",
+        "firsttower",
+        "firstmidtower",
+        "firsttothreetowers",
+        "towers",
+        "opp_towers",
     ]:
         if numeric_col in out.columns:
             out[numeric_col] = pd.to_numeric(out[numeric_col], errors="coerce")

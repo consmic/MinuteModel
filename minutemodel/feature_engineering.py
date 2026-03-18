@@ -62,6 +62,33 @@ EXTENDED_PRIOR_COLUMNS: List[str] = [
     "rolling_side_duration_prior_diff_seconds",
 ]
 
+TURRET_PRIOR_COLUMNS: List[str] = [
+    "blue_rolling_firsttower_rate_prior",
+    "red_rolling_firsttower_rate_prior",
+    "rolling_firsttower_rate_prior_diff",
+    "blue_rolling_towers_prior",
+    "red_rolling_towers_prior",
+    "rolling_towers_prior_diff",
+    "blue_rolling_tower_diff_prior",
+    "red_rolling_tower_diff_prior",
+    "rolling_tower_diff_prior_diff",
+]
+
+EXTENDED_TURRET_PRIOR_COLUMNS: List[str] = [
+    "blue_rolling_firstmidtower_rate_prior",
+    "red_rolling_firstmidtower_rate_prior",
+    "rolling_firstmidtower_rate_prior_diff",
+    "blue_rolling_firsttothreetowers_rate_prior",
+    "red_rolling_firsttothreetowers_rate_prior",
+    "rolling_firsttothreetowers_rate_prior_diff",
+    "blue_rolling_side_towers_prior",
+    "red_rolling_side_towers_prior",
+    "rolling_side_towers_prior_diff",
+    "blue_rolling_side_firsttower_rate_prior",
+    "red_rolling_side_firsttower_rate_prior",
+    "rolling_side_firsttower_rate_prior_diff",
+]
+
 CONDITIONAL_PRIOR_COLUMNS: List[str] = [
     "blue_conditional_duration_when_early_prior_seconds",
     "red_conditional_duration_when_early_prior_seconds",
@@ -352,6 +379,11 @@ def _build_team_history(match_df: pd.DataFrame) -> pd.DataFrame:
                 "firstbaron_source": row.get("blue_firstbaron_source"),
                 "barons_source": row.get("blue_barons_source"),
                 "golddiffat15_source": row.get("blue_golddiffat15_source"),
+                "firsttower_source": row.get("blue_firsttower_source"),
+                "firstmidtower_source": row.get("blue_firstmidtower_source"),
+                "firsttothreetowers_source": row.get("blue_firsttothreetowers_source"),
+                "towers_source": row.get("blue_towers_source"),
+                "opp_towers_source": row.get("blue_opp_towers_source"),
                 "team_archetype": ctx["blue_archetype"],
                 "opp_archetype": ctx["red_archetype"],
                 "is_early_comp": float(ctx["blue_archetype"] == "early"),
@@ -380,6 +412,11 @@ def _build_team_history(match_df: pd.DataFrame) -> pd.DataFrame:
                 "firstbaron_source": row.get("red_firstbaron_source"),
                 "barons_source": row.get("red_barons_source"),
                 "golddiffat15_source": row.get("red_golddiffat15_source"),
+                "firsttower_source": row.get("red_firsttower_source"),
+                "firstmidtower_source": row.get("red_firstmidtower_source"),
+                "firsttothreetowers_source": row.get("red_firsttothreetowers_source"),
+                "towers_source": row.get("red_towers_source"),
+                "opp_towers_source": row.get("red_opp_towers_source"),
                 "team_archetype": ctx["red_archetype"],
                 "opp_archetype": ctx["blue_archetype"],
                 "is_early_comp": float(ctx["red_archetype"] == "early"),
@@ -411,6 +448,12 @@ def _build_team_history(match_df: pd.DataFrame) -> pd.DataFrame:
     history["firstbaron_source"] = _coerce_binary_series(history["firstbaron_source"])
     history["barons_source"] = _to_float_series(history["barons_source"])
     history["golddiffat15_source"] = _to_float_series(history["golddiffat15_source"])
+    history["firsttower_source"] = _coerce_binary_series(history["firsttower_source"])
+    history["firstmidtower_source"] = _coerce_binary_series(history["firstmidtower_source"])
+    history["firsttothreetowers_source"] = _coerce_binary_series(history["firsttothreetowers_source"])
+    history["towers_source"] = _to_float_series(history["towers_source"])
+    history["opp_towers_source"] = _to_float_series(history["opp_towers_source"])
+    history["tower_diff_source"] = history["towers_source"] - history["opp_towers_source"]
 
     # Proxy for "dragons by 20" where explicit @20 objective timings are unavailable.
     history["dragons_by20_proxy_source"] = history["dragons_source"]
@@ -623,10 +666,20 @@ def build_leakage_safe_rolling_priors(match_df: pd.DataFrame, config: PipelineCo
         "firstherald_source",
         "firstbaron_source",
         "golddiffat15_source",
+        "firsttower_source",
+        "towers_source",
+        "tower_diff_source",
+        "firstmidtower_source",
+        "firsttothreetowers_source",
     ]
     _add_group_fallback_columns(history, value_cols=numeric_value_cols)
 
     window = int(max(config.rolling_window_size, 1))
+    turret_priors_active = bool(
+        config.use_turret_prior_features
+        or config.use_extended_turret_prior_features
+        or config.run_turret_feature_ablation
+    )
 
     _compute_prior(
         history,
@@ -711,6 +764,58 @@ def build_leakage_safe_rolling_priors(match_df: pd.DataFrame, config: PipelineCo
         group_col="team_side_key",
     )
 
+    if turret_priors_active:
+        _compute_prior(
+            history,
+            value_col="firsttower_source",
+            out_col="rolling_firsttower_rate_prior",
+            window=window,
+            group_col="team_key",
+        )
+        _compute_prior(
+            history,
+            value_col="towers_source",
+            out_col="rolling_towers_prior",
+            window=window,
+            group_col="team_key",
+        )
+        _compute_prior(
+            history,
+            value_col="tower_diff_source",
+            out_col="rolling_tower_diff_prior",
+            window=window,
+            group_col="team_key",
+        )
+
+        _compute_prior(
+            history,
+            value_col="firstmidtower_source",
+            out_col="rolling_firstmidtower_rate_prior",
+            window=window,
+            group_col="team_key",
+        )
+        _compute_prior(
+            history,
+            value_col="firsttothreetowers_source",
+            out_col="rolling_firsttothreetowers_rate_prior",
+            window=window,
+            group_col="team_key",
+        )
+        _compute_prior(
+            history,
+            value_col="towers_source",
+            out_col="rolling_side_towers_prior",
+            window=window,
+            group_col="team_side_key",
+        )
+        _compute_prior(
+            history,
+            value_col="firsttower_source",
+            out_col="rolling_side_firsttower_rate_prior",
+            window=window,
+            group_col="team_side_key",
+        )
+
     _build_conditional_priors(history, config=config)
 
     side_feature_cols = [
@@ -732,6 +837,16 @@ def build_leakage_safe_rolling_priors(match_df: pd.DataFrame, config: PipelineCo
         "conditional_ckpm_skirmish_prior",
         "conditional_duration_similar_matchup_prior_seconds",
     ]
+    if turret_priors_active:
+        side_feature_cols += [
+            "rolling_firsttower_rate_prior",
+            "rolling_towers_prior",
+            "rolling_tower_diff_prior",
+            "rolling_firstmidtower_rate_prior",
+            "rolling_firsttothreetowers_rate_prior",
+            "rolling_side_towers_prior",
+            "rolling_side_firsttower_rate_prior",
+        ]
 
     merged = _merge_side_features(work, history, side_feature_cols)
 
@@ -754,6 +869,18 @@ def build_leakage_safe_rolling_priors(match_df: pd.DataFrame, config: PipelineCo
         "conditional_ckpm_skirmish_prior": "conditional_ckpm_skirmish_prior_diff",
         "conditional_duration_similar_matchup_prior_seconds": "conditional_duration_similar_matchup_prior_diff_seconds",
     }
+    if turret_priors_active:
+        diff_map.update(
+            {
+                "rolling_firsttower_rate_prior": "rolling_firsttower_rate_prior_diff",
+                "rolling_towers_prior": "rolling_towers_prior_diff",
+                "rolling_tower_diff_prior": "rolling_tower_diff_prior_diff",
+                "rolling_firstmidtower_rate_prior": "rolling_firstmidtower_rate_prior_diff",
+                "rolling_firsttothreetowers_rate_prior": "rolling_firsttothreetowers_rate_prior_diff",
+                "rolling_side_towers_prior": "rolling_side_towers_prior_diff",
+                "rolling_side_firsttower_rate_prior": "rolling_side_firsttower_rate_prior_diff",
+            }
+        )
     for base_col, diff_col in diff_map.items():
         _add_diff_feature(merged, base_col=base_col, diff_col=diff_col)
 
@@ -795,19 +922,28 @@ class DraftFeatureBuilder:
         else:
             self.champion_scaling_lookup_ = None
 
-        if self.config.use_bag_of_champions_fallback:
+        if self.config.use_bag_of_champions_fallback and self.config.use_sparse_champion_indicator_features:
             blue_lists = match_df.get("blue_draft_champions", pd.Series([[]] * len(match_df))).apply(_sanitize_draft_list)
             red_lists = match_df.get("red_draft_champions", pd.Series([[]] * len(match_df))).apply(_sanitize_draft_list)
             self.blue_mlb.fit(blue_lists)
             self.red_mlb.fit(red_lists)
             self.blue_classes_set_ = set(self.blue_mlb.classes_.tolist())
             self.red_classes_set_ = set(self.red_mlb.classes_.tolist())
+        else:
+            self.blue_classes_set_ = set()
+            self.red_classes_set_ = set()
 
         prior_cols = BASE_PRIOR_COLUMNS.copy()
         if self.config.use_extended_rolling_team_priors:
             prior_cols += EXTENDED_PRIOR_COLUMNS
+        if self.config.use_turret_prior_features:
+            prior_cols += TURRET_PRIOR_COLUMNS
+            if self.config.use_extended_turret_prior_features:
+                prior_cols += EXTENDED_TURRET_PRIOR_COLUMNS
         if self.config.use_draft_conditional_behaviour_features:
             prior_cols += CONDITIONAL_PRIOR_COLUMNS
+        if self.config.use_series_game_number_feature:
+            prior_cols += ["game"]
 
         self.numeric_fill_values_ = {}
         for col in prior_cols:
@@ -925,10 +1061,16 @@ class DraftFeatureBuilder:
         features["blue_first_pick"] = pd.to_numeric(match_df.get("blue_first_pick"), errors="coerce").fillna(0.0)
         features["red_first_pick"] = pd.to_numeric(match_df.get("red_first_pick"), errors="coerce").fillna(0.0)
         features["year"] = pd.to_numeric(match_df.get("year"), errors="coerce").fillna(0.0)
+        if self.config.use_series_game_number_feature:
+            features["game"] = self._numeric_feature(match_df, "game")
 
         prior_cols = BASE_PRIOR_COLUMNS.copy()
         if self.config.use_extended_rolling_team_priors:
             prior_cols += EXTENDED_PRIOR_COLUMNS
+        if self.config.use_turret_prior_features:
+            prior_cols += TURRET_PRIOR_COLUMNS
+            if self.config.use_extended_turret_prior_features:
+                prior_cols += EXTENDED_TURRET_PRIOR_COLUMNS
         if self.config.use_draft_conditional_behaviour_features:
             prior_cols += CONDITIONAL_PRIOR_COLUMNS
 
@@ -951,18 +1093,6 @@ class DraftFeatureBuilder:
             for col in role_cols:
                 features[col] = match_df.get(col, np.nan).astype("object")
 
-        pick_cols = [
-            "blue_pick1",
-            "blue_pick2",
-            "blue_pick3",
-            "blue_pick4",
-            "blue_pick5",
-            "red_pick1",
-            "red_pick2",
-            "red_pick3",
-            "red_pick4",
-            "red_pick5",
-        ]
         ban_cols = [
             "blue_ban1",
             "blue_ban2",
@@ -975,7 +1105,22 @@ class DraftFeatureBuilder:
             "red_ban4",
             "red_ban5",
         ]
-        for col in pick_cols + ban_cols:
+        pick_cols = [
+            "blue_pick1",
+            "blue_pick2",
+            "blue_pick3",
+            "blue_pick4",
+            "blue_pick5",
+            "red_pick1",
+            "red_pick2",
+            "red_pick3",
+            "red_pick4",
+            "red_pick5",
+        ]
+        champion_slot_cols = ban_cols.copy()
+        if self.config.use_pick_order_champion_features:
+            champion_slot_cols = pick_cols + champion_slot_cols
+        for col in champion_slot_cols:
             features[col] = match_df.get(col, np.nan).astype("object")
 
         draft_summary_df: Optional[pd.DataFrame] = None
@@ -999,7 +1144,7 @@ class DraftFeatureBuilder:
                 interaction_payload[col] = pd.to_numeric(interaction_payload[col], errors="coerce")
             features = pd.concat([features, interaction_payload], axis=1)
 
-        if self.config.use_bag_of_champions_fallback:
+        if self.config.use_bag_of_champions_fallback and self.config.use_sparse_champion_indicator_features:
             blue_lists_raw = match_df.get("blue_draft_champions", pd.Series([[]] * len(match_df))).apply(_sanitize_draft_list)
             red_lists_raw = match_df.get("red_draft_champions", pd.Series([[]] * len(match_df))).apply(_sanitize_draft_list)
 

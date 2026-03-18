@@ -34,6 +34,44 @@ def regression_metrics_seconds(y_true_sec: np.ndarray, y_pred_sec: np.ndarray) -
     return metrics
 
 
+def pinball_loss(y_true: np.ndarray, y_pred: np.ndarray, alpha: float) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    residual = y_true - y_pred
+    return float(np.mean(np.maximum(alpha * residual, (alpha - 1.0) * residual)))
+
+
+def quantile_interval_metrics_seconds(
+    y_true_sec: np.ndarray,
+    y_pred_p50_sec: np.ndarray,
+    y_pred_lower_sec: np.ndarray,
+    y_pred_upper_sec: np.ndarray,
+    lower_alpha: float,
+    upper_alpha: float,
+) -> Dict[str, float]:
+    base_metrics = regression_metrics_seconds(y_true_sec, y_pred_p50_sec)
+
+    lower = np.asarray(y_pred_lower_sec, dtype=float)
+    upper = np.asarray(y_pred_upper_sec, dtype=float)
+    y_true = np.asarray(y_true_sec, dtype=float)
+    width_minutes = (upper - lower) / 60.0
+    in_interval = (y_true >= lower) & (y_true <= upper)
+
+    metrics = dict(base_metrics)
+    metrics.update(
+        {
+            "lower_quantile": float(lower_alpha),
+            "upper_quantile": float(upper_alpha),
+            "average_interval_width_minutes": float(np.mean(width_minutes)),
+            "median_interval_width_minutes": float(np.median(width_minutes)),
+            "interval_coverage": float(np.mean(in_interval)),
+            "undercoverage_rate": float(np.mean(y_true < lower)),
+            "overcoverage_rate": float(np.mean(y_true > upper)),
+        }
+    )
+    return metrics
+
+
 def benchmarking_table(metrics_by_model: Dict[str, Dict[str, float]]) -> pd.DataFrame:
     table = pd.DataFrame(metrics_by_model).T.sort_values("mae_minutes")
     table.index.name = "model"

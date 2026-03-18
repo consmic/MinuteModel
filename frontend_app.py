@@ -35,6 +35,7 @@ from frontend_ui import (
     options_with_current,
     parse_role_quick_input,
     recent_template_rows,
+    render_duration_prediction_card,
     render_empty_state,
     render_info_panel,
     render_page_intro,
@@ -392,14 +393,14 @@ def _consume_calendar_prefill(ctx: AppContext, defaults: Dict[str, Any]) -> None
     st.success("Loaded selected calendar match into the prediction form.")
 
 def _prediction_result_card(ctx: AppContext, result: Dict[str, Any]) -> None:
-    pred_minutes = _safe_float(result.get("predicted_duration_minutes"), 0.0)
-    pred_seconds = _safe_float(result.get("predicted_duration_seconds"), 0.0)
+    quantile_payload = result.get("quantile_predictions", {}) or {}
+    pred_minutes = _safe_float(
+        quantile_payload.get("predicted_p50_minutes", result.get("predicted_p50_minutes", result.get("predicted_duration_minutes"))),
+        0.0,
+    )
     mae_minutes = _safe_float(result.get("mae_context_minutes"), 4.2)
     rmse_minutes = _safe_float(result.get("rmse_context_minutes"), max(mae_minutes * 1.3, 1.8))
     line_minutes = _safe_float(result.get("market_line_minutes"), 0.0)
-
-    lower = max(pred_minutes - mae_minutes, 0.0)
-    upper = pred_minutes + mae_minutes
 
     confidence_label = "Directional"
     confidence_detail = "Set a market line to derive directional probability."
@@ -427,30 +428,30 @@ def _prediction_result_card(ctx: AppContext, result: Dict[str, Any]) -> None:
             f"Under {line_minutes:.1f}m: {p_under * 100:.1f}%"
         )
 
-    timestamp = result.get("prediction_timestamp_utc", pd.Timestamp.now(tz="UTC").isoformat())
-    render_section_heading("Prediction Result", "Core output and confidence diagnostics.")
-    render_info_panel(
-        "Expected Match Duration",
-        f"{pred_minutes:.2f} minutes ({_clock_from_seconds(pred_seconds)} clock). "
-        f"Practical range: {lower:.1f} to {upper:.1f} minutes.",
-        tone="positive",
+    quantile_thresholds = ((ctx.artifacts or {}).get("quantile_regression", {}) or {}).get("volatility_thresholds_minutes", {})
+
+    render_section_heading(
+        "Prediction Result",
+        "p50 is the headline forecast. p10-p90 shows the likely pre-game duration range.",
+    )
+    render_duration_prediction_card(
+        prediction=result,
+        volatility_thresholds_minutes=quantile_thresholds if isinstance(quantile_thresholds, dict) else None,
     )
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Predicted winner / side", predicted_side)
-    k2.metric("Win probability", f"{win_probability * 100:.1f}%" if win_probability is not None else "N/A")
-    k3.metric("Confidence / edge", f"{confidence_label}{f' ({edge_pct:.1f}%)' if edge_pct is not None else ''}")
-    k4.metric("Free predictions left", get_usage_snapshot()["remaining"])
-
     if line_minutes > 0 and p_over is not None and p_under is not None:
+        render_section_heading("Market Context", "Optional over/under framing relative to your chosen line.")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Market lean", predicted_side)
+        k2.metric("Win probability", f"{win_probability * 100:.1f}%")
+        k3.metric("Confidence / edge", f"{confidence_label} ({edge_pct:.1f}%)")
+        k4.metric("Line", f"{line_minutes:.1f} min")
         st.info(
-            f"{confidence_detail}. Estimated edge: {edge_pct:.1f}%. Timestamp: {timestamp}"
+            f"{confidence_detail}. Estimated edge: {edge_pct:.1f}%."
         )
         st.caption(
             "Probability uses a normal error approximation around model RMSE and should be treated as directional."
         )
-    else:
-        st.caption(f"{confidence_detail} Timestamp: {timestamp}")
 
     explanation = result.get("explanation")
     if explanation:
@@ -825,6 +826,7 @@ def _render_predictions_page(ctx: AppContext) -> None:
         if rmse_context is None:
             rmse_context = max(float(mae_context) * 1.3, 1.8)
 
+        quantile_payload = prediction.get("quantile_predictions", {}) or {}
         result_record = {
             "prediction_id": prediction_id,
             "prediction_timestamp_utc": pd.Timestamp.now(tz="UTC").isoformat(),
@@ -839,6 +841,15 @@ def _render_predictions_page(ctx: AppContext) -> None:
             "market_line_minutes": float(market_line_minutes),
             "payload": payload,
             "explanation": prediction.get("explanation"),
+            "quantile_predictions": quantile_payload,
+            "predicted_p10_minutes": _safe_float(quantile_payload.get("predicted_p10_minutes"), np.nan),
+            "predicted_p50_minutes": _safe_float(
+                quantile_payload.get("predicted_p50_minutes", prediction.get("predicted_duration_minutes")),
+                np.nan,
+            ),
+            "predicted_p90_minutes": _safe_float(quantile_payload.get("predicted_p90_minutes"), np.nan),
+            "interval_width_minutes": _safe_float(quantile_payload.get("interval_width_minutes"), np.nan),
+            "volatility_flag": quantile_payload.get("volatility_flag"),
         }
         st.session_state["last_prediction"] = result_record
         st.session_state["last_saved_prediction_id"] = None
