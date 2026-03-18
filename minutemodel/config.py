@@ -38,6 +38,20 @@ ALLOWED_DRAFT_COLUMNS: List[str] = [
 
 TARGET_COLUMNS: List[str] = ["gamelength"]
 
+# Post-game columns allowed as *historical source signals* for rolling priors only.
+# These must never be used as direct current-match features.
+HISTORICAL_PRIOR_SOURCE_COLUMNS: List[str] = [
+    "result",
+    "firstblood",
+    "firstdragon",
+    "dragons",
+    "firstherald",
+    "heralds",
+    "firstbaron",
+    "barons",
+    "golddiffat15",
+]
+
 IDENTIFIER_COLUMNS: List[str] = [
     "participantid",
     "datacompleteness",
@@ -137,6 +151,12 @@ class PipelineConfig:
     target_unit: str = "seconds"
     rolling_window_size: int = 10
     use_champion_scaling_features: bool = False
+    use_extended_rolling_team_priors: bool = True
+    use_draft_summary_features: bool = True
+    use_draft_interaction_features: bool = True
+    use_draft_conditional_behaviour_features: bool = True
+    draft_conditional_min_samples: int = 5
+    run_feature_group_ablation: bool = True
     champion_scaling_method: str = "avg_duration_delta"
     champion_scaling_smoothing: bool = True
     champion_scaling_min_samples: int = 20
@@ -247,6 +267,8 @@ class PipelineConfig:
             raise ValueError("champion_scaling_min_samples must be >= 1.")
         if self.champion_scaling_recency_half_life_days < 1:
             raise ValueError("champion_scaling_recency_half_life_days must be >= 1.")
+        if self.draft_conditional_min_samples < 1:
+            raise ValueError("draft_conditional_min_samples must be >= 1.")
 
 
 def is_forbidden_feature_column(column_name: str) -> bool:
@@ -257,4 +279,4 @@ def is_forbidden_feature_column(column_name: str) -> bool:
 
 
 def allowed_raw_columns() -> List[str]:
-    return ALLOWED_COLUMNS.copy()
+    return sorted(set(ALLOWED_COLUMNS + HISTORICAL_PRIOR_SOURCE_COLUMNS))

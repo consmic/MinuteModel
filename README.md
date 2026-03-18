@@ -12,10 +12,14 @@ This is a **draft-only benchmark model** designed to be:
 - Schema inspection for raw Oracle's Elixir row structure
 - Safe flattening from multi-row raw data to **one row per match (`gameid`)**
 - Leakage-safe historical team rolling priors (duration and optional CKPM)
+- Extended leakage-safe rolling priors (win/objective/gold-diff/side priors)
 - Draft feature generation:
   - role-aware champions (when available)
   - bag-of-champions fallback (configurable)
   - optional champion scaling / composition pace priors (configurable)
+  - optional dense draft summary scores (early/scaling/engage/peel/poke/etc.)
+  - optional draft interaction features (tempo/snowball-vs-stall style)
+  - optional draft-conditional team behavior priors
 - Baseline models:
   - global mean
   - league mean
@@ -113,6 +117,18 @@ Concrete lists are defined in `minutemodel/config.py` as `ALLOWED_COLUMNS`, `FOR
 For each team-side row in chronological order:
 - rolling 10-game average duration (shifted by 1 match)
 - optional rolling 10-game CKPM (shifted by 1 match)
+- optional rolling win/objective/gold-diff priors (shifted by 1 match)
+- optional side-specific win/duration priors (shifted by 1 match)
+
+Additional leakage-safe conditional priors (optional):
+- team average duration on early-game archetypes
+- team average duration on scaling archetypes
+- first-dragon rate on early archetypes
+- herald rate vs scaling opponents
+- CKPM on skirmish-heavy drafts
+- duration in similar archetype-vs-archetype matchups
+
+All of the above are computed with strict `shift(1)` logic so current/future rows cannot leak into current-match features.
 
 Fallback chain when history is short:
 1. league expanding prior (historical only)
@@ -159,6 +175,12 @@ Required/important options:
 - `target_unit` (`seconds` or `minutes`)
 - `rolling_window_size`
 - `use_champion_scaling_features`
+- `use_extended_rolling_team_priors`
+- `use_draft_summary_features`
+- `use_draft_interaction_features`
+- `use_draft_conditional_behaviour_features`
+- `draft_conditional_min_samples`
+- `run_feature_group_ablation`
 - `champion_scaling_method` (`avg_duration_delta`)
 - `champion_scaling_smoothing`
 - `champion_scaling_min_samples`
@@ -202,8 +224,11 @@ Outputs include:
 - `reports/benchmark_summary.csv`
 - `reports/metrics_summary.json`
 - `reports/champion_scaling_ablation.csv` (with/without scaling for current primary model)
+- `reports/feature_group_ablation.csv` + `reports/feature_group_ablation.json` (A→E feature-group ablation)
 - `reports/champion_scaling_lookup.csv` (if scaling enabled)
 - `artifacts/champion_scaling_lookup.joblib` (if scaling enabled)
+- `reports/model_input_feature_columns.csv` + `reports/transformed_feature_columns.csv`
+- `reports/catboost_feature_importance.csv` (when primary model is CatBoost)
 - residual/error breakdown plots
 - `reports/shap/` diagnostics
 

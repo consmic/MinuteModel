@@ -84,7 +84,23 @@ def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     if "date" in out.columns:
         out["date"] = pd.to_datetime(out["date"], errors="coerce", utc=False)
 
-    for numeric_col in ["year", "game", "participantid", "gamelength", "firstPick", "ckpm"]:
+    for numeric_col in [
+        "year",
+        "game",
+        "participantid",
+        "gamelength",
+        "firstPick",
+        "ckpm",
+        "result",
+        "firstblood",
+        "firstdragon",
+        "dragons",
+        "firstherald",
+        "heralds",
+        "firstbaron",
+        "barons",
+        "golddiffat15",
+    ]:
         if numeric_col in out.columns:
             out[numeric_col] = pd.to_numeric(out[numeric_col], errors="coerce")
 

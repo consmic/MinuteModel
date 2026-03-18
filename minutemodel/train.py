@@ -451,6 +451,106 @@ def _train_catboost_variant(split: SplitData, config: PipelineConfig) -> Dict[st
     }
 
 
+def _save_feature_column_artifacts(
+    reports_dir: str | Path,
+    categorical_cols: List[str],
+    numeric_cols: List[str],
+    transformed_feature_names: List[str],
+) -> None:
+    target_dir = ensure_dir(reports_dir)
+
+    input_rows = (
+        [{"feature": col, "feature_type": "categorical"} for col in categorical_cols]
+        + [{"feature": col, "feature_type": "numeric"} for col in numeric_cols]
+    )
+    pd.DataFrame(input_rows).to_csv(target_dir / "model_input_feature_columns.csv", index=False)
+
+    pd.DataFrame({"feature": transformed_feature_names}).to_csv(
+        target_dir / "transformed_feature_columns.csv",
+        index=False,
+    )
+
+
+def _save_catboost_feature_importance(
+    model: Any,
+    feature_names: List[str],
+    reports_dir: str | Path,
+) -> str | None:
+    if not hasattr(model, "get_feature_importance"):
+        return None
+
+    importances = model.get_feature_importance()
+    if importances is None:
+        return None
+
+    importance_df = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "importance": pd.to_numeric(importances, errors="coerce"),
+        }
+    ).sort_values("importance", ascending=False)
+
+    path = Path(reports_dir) / "catboost_feature_importance.csv"
+    importance_df.to_csv(path, index=False)
+    return str(path)
+
+
+def _feature_group_ablation_configs(base_config: PipelineConfig) -> List[Tuple[str, PipelineConfig]]:
+    variants = [
+        (
+            "A_baseline",
+            replace(
+                base_config,
+                use_extended_rolling_team_priors=False,
+                use_draft_summary_features=False,
+                use_draft_interaction_features=False,
+                use_draft_conditional_behaviour_features=False,
+            ),
+        ),
+        (
+            "B_plus_extra_rolling",
+            replace(
+                base_config,
+                use_extended_rolling_team_priors=True,
+                use_draft_summary_features=False,
+                use_draft_interaction_features=False,
+                use_draft_conditional_behaviour_features=False,
+            ),
+        ),
+        (
+            "C_plus_draft_summary",
+            replace(
+                base_config,
+                use_extended_rolling_team_priors=True,
+                use_draft_summary_features=True,
+                use_draft_interaction_features=False,
+                use_draft_conditional_behaviour_features=False,
+            ),
+        ),
+        (
+            "D_plus_interactions",
+            replace(
+                base_config,
+                use_extended_rolling_team_priors=True,
+                use_draft_summary_features=True,
+                use_draft_interaction_features=True,
+                use_draft_conditional_behaviour_features=False,
+            ),
+        ),
+        (
+            "E_plus_conditional_behaviour",
+            replace(
+                base_config,
+                use_extended_rolling_team_priors=True,
+                use_draft_summary_features=True,
+                use_draft_interaction_features=True,
+                use_draft_conditional_behaviour_features=True,
+            ),
+        ),
+    ]
+    return variants
+
+
 def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
     config.validate()
     seed_everything(config.random_seed)
@@ -497,6 +597,13 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
     feature_names: List[str] = main_run["feature_names"]
     primary_preds_model_unit: np.ndarray = main_run["preds_model_unit"]
 
+    _save_feature_column_artifacts(
+        reports_dir=reports_dir,
+        categorical_cols=categorical_cols,
+        numeric_cols=numeric_cols,
+        transformed_feature_names=feature_names,
+    )
+
     # Baselines (trained on train+val where no tuning is required).
     global_mean_value = float(np.mean(y_train_val))
 
@@ -540,8 +647,8 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
     benchmark_df.to_csv(benchmark_path)
     LOGGER.info("Saved benchmark summary to %s", benchmark_path)
 
-    ablation_payload: Dict[str, Any] = {}
-    ablation_path: Path | None = None
+    champion_scaling_ablation_payload: Dict[str, Any] = {}
+    champion_scaling_ablation_path: Path | None = None
     if config.run_champion_scaling_ablation:
         variant_train_fn = _train_catboost_variant if config.primary_model == "catboost" else _train_lightgbm_variant
         variant_metrics: Dict[str, Dict[str, float]] = {}
@@ -567,17 +674,81 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
             ablation_df["within_5_minutes_accuracy"] - float(without_row["within_5_minutes_accuracy"])
         )
 
-        ablation_path = Path(reports_dir) / "champion_scaling_ablation.csv"
-        ablation_df.to_csv(ablation_path)
-        LOGGER.info("Saved champion scaling ablation summary to %s", ablation_path)
+        champion_scaling_ablation_path = Path(reports_dir) / "champion_scaling_ablation.csv"
+        ablation_df.to_csv(champion_scaling_ablation_path)
+        LOGGER.info("Saved champion scaling ablation summary to %s", champion_scaling_ablation_path)
 
-        ablation_payload = {
+        champion_scaling_ablation_payload = {
             "enabled": True,
             "variant_metrics": variant_metrics,
-            "ablation_csv": str(ablation_path),
+            "ablation_csv": str(champion_scaling_ablation_path),
         }
     else:
-        ablation_payload = {"enabled": False}
+        champion_scaling_ablation_payload = {"enabled": False}
+
+    feature_group_ablation_payload: Dict[str, Any] = {"enabled": False}
+    feature_group_ablation_csv_path: Path | None = None
+    feature_group_ablation_json_path: Path | None = None
+    if config.run_feature_group_ablation:
+        variant_train_fn = _train_catboost_variant if config.primary_model == "catboost" else _train_lightgbm_variant
+        variant_metrics: Dict[str, Dict[str, float]] = {}
+        variant_feature_counts: Dict[str, int] = {}
+
+        for label, variant_cfg in _feature_group_ablation_configs(config):
+            LOGGER.info(
+                "Running feature-group ablation variant=%s (rolling=%s, summary=%s, interaction=%s, conditional=%s)",
+                label,
+                variant_cfg.use_extended_rolling_team_priors,
+                variant_cfg.use_draft_summary_features,
+                variant_cfg.use_draft_interaction_features,
+                variant_cfg.use_draft_conditional_behaviour_features,
+            )
+            same_as_main = (
+                variant_cfg.use_extended_rolling_team_priors == config.use_extended_rolling_team_priors
+                and variant_cfg.use_draft_summary_features == config.use_draft_summary_features
+                and variant_cfg.use_draft_interaction_features == config.use_draft_interaction_features
+                and variant_cfg.use_draft_conditional_behaviour_features == config.use_draft_conditional_behaviour_features
+                and variant_cfg.use_champion_scaling_features == config.use_champion_scaling_features
+            )
+            variant_run = main_run if same_as_main else variant_train_fn(split=split, config=variant_cfg)
+            variant_metrics[label] = variant_run["metrics"]
+            variant_feature_counts[label] = int(len(variant_run["feature_names"]))
+
+        ablation_df = benchmarking_table(variant_metrics)
+        ablation_df["feature_count"] = pd.Series(variant_feature_counts)
+        baseline_row = ablation_df.loc["A_baseline"]
+        ablation_df["mae_minutes_delta_vs_A"] = ablation_df["mae_minutes"] - float(baseline_row["mae_minutes"])
+        ablation_df["rmse_minutes_delta_vs_A"] = ablation_df["rmse_minutes"] - float(baseline_row["rmse_minutes"])
+        ablation_df["median_absolute_error_minutes_delta_vs_A"] = (
+            ablation_df["median_absolute_error_minutes"] - float(baseline_row["median_absolute_error_minutes"])
+        )
+        ablation_df["within_2_minutes_accuracy_delta_vs_A"] = (
+            ablation_df["within_2_minutes_accuracy"] - float(baseline_row["within_2_minutes_accuracy"])
+        )
+        ablation_df["within_5_minutes_accuracy_delta_vs_A"] = (
+            ablation_df["within_5_minutes_accuracy"] - float(baseline_row["within_5_minutes_accuracy"])
+        )
+
+        feature_group_ablation_csv_path = Path(reports_dir) / "feature_group_ablation.csv"
+        ablation_df.to_csv(feature_group_ablation_csv_path)
+        feature_group_ablation_json_path = Path(reports_dir) / "feature_group_ablation.json"
+        write_json(
+            {
+                "variants": list(ablation_df.index),
+                "metrics_by_variant": variant_metrics,
+                "feature_count_by_variant": variant_feature_counts,
+            },
+            feature_group_ablation_json_path,
+        )
+        LOGGER.info("Saved feature-group ablation to %s and %s", feature_group_ablation_csv_path, feature_group_ablation_json_path)
+
+        feature_group_ablation_payload = {
+            "enabled": True,
+            "ablation_csv": str(feature_group_ablation_csv_path),
+            "ablation_json": str(feature_group_ablation_json_path),
+            "variant_metrics": variant_metrics,
+            "feature_count_by_variant": variant_feature_counts,
+        }
 
     test_eval_df = split.test[["gameid", "league", "patch", "date", "target_gamelength_seconds"]].copy()
     test_eval_df = test_eval_df.rename(columns={"target_gamelength_seconds": "y_true_seconds"})
@@ -601,6 +772,16 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
     save_error_bar_plot(patch_breakdown, "patch", reports_dir, primary_model_name)
     save_error_bar_plot(bucket_breakdown, "duration_bucket", reports_dir, primary_model_name)
     LOGGER.info("Saved error breakdown plots.")
+
+    catboost_feature_importance_path: str | None = None
+    if primary_model_name == "catboost":
+        catboost_feature_importance_path = _save_catboost_feature_importance(
+            model=final_primary_model,
+            feature_names=feature_names,
+            reports_dir=reports_dir,
+        )
+        if catboost_feature_importance_path:
+            LOGGER.info("Saved CatBoost feature importance to %s", catboost_feature_importance_path)
 
     _save_shap_diagnostics(final_primary_model, X_test_transformed, feature_names, Path(reports_dir) / "shap")
     LOGGER.info("SHAP diagnostics step completed.")
@@ -632,6 +813,8 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
         "schema_report": schema_report.to_dict(),
         "config": config.to_dict(),
         "feature_names": feature_names,
+        "input_feature_columns_csv": str(Path(reports_dir) / "model_input_feature_columns.csv"),
+        "transformed_feature_columns_csv": str(Path(reports_dir) / "transformed_feature_columns.csv"),
     }
     if primary_model_name == "lightgbm":
         model_payload["best_lightgbm_params"] = best_params
@@ -647,6 +830,8 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
         model_payload["champion_scaling_lookup_csv"] = champion_scaling_lookup_path
     if champion_scaling_lookup_artifact_path:
         model_payload["champion_scaling_lookup_artifact"] = champion_scaling_lookup_artifact_path
+    if catboost_feature_importance_path:
+        model_payload["catboost_feature_importance_csv"] = catboost_feature_importance_path
 
     joblib.dump(model_payload, Path(output_dir) / "model_artifacts.joblib")
     LOGGER.info("Saved model artifacts.")
@@ -672,7 +857,9 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
             "primary_model_best_params": best_params,
             "primary_model_validation_mae_seconds": best_val_mae_seconds,
             "ridge_alpha": best_alpha,
-            "champion_scaling_ablation": ablation_payload,
+            "split": split_summary,
+            "champion_scaling_ablation": champion_scaling_ablation_payload,
+            "feature_group_ablation": feature_group_ablation_payload,
         },
         Path(reports_dir) / "metrics_summary.json",
     )
@@ -685,7 +872,10 @@ def train_and_evaluate(config: PipelineConfig) -> Dict[str, object]:
         "primary_model": primary_model_name,
         "metrics_by_model": metrics_by_model,
         "benchmark_csv": str(benchmark_path),
-        "champion_scaling_ablation_csv": str(ablation_path) if ablation_path else None,
+        "champion_scaling_ablation_csv": str(champion_scaling_ablation_path) if champion_scaling_ablation_path else None,
+        "feature_group_ablation_csv": str(feature_group_ablation_csv_path) if feature_group_ablation_csv_path else None,
+        "feature_group_ablation_json": str(feature_group_ablation_json_path) if feature_group_ablation_json_path else None,
+        "catboost_feature_importance_csv": catboost_feature_importance_path,
         "artifacts_path": str(Path(output_dir) / "model_artifacts.joblib"),
         "reports_dir": str(reports_dir),
     }

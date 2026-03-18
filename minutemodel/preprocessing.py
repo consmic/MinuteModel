@@ -13,6 +13,17 @@ LOGGER = logging.getLogger(__name__)
 
 ROLE_ORDER = ["top", "jng", "mid", "bot", "sup"]
 TEAM_META_COLUMNS = ["teamid", "teamname", "firstPick", "ckpm"]
+TEAM_HISTORY_SOURCE_COLUMNS = [
+    "result",
+    "firstblood",
+    "firstdragon",
+    "dragons",
+    "firstherald",
+    "heralds",
+    "firstbaron",
+    "barons",
+    "golddiffat15",
+]
 MATCH_META_COLUMNS = ["league", "year", "split", "playoffs", "date", "patch", "game", "url"]
 
 
@@ -56,6 +67,12 @@ def _extract_team_payload(side_df: pd.DataFrame, side_label: str) -> Dict[str, A
     }
 
     for col in TEAM_META_COLUMNS:
+        if col in side_df.columns:
+            payload[col] = _first_stable_value(side_df[col])
+        else:
+            payload[col] = None
+
+    for col in TEAM_HISTORY_SOURCE_COLUMNS:
         if col in side_df.columns:
             payload[col] = _first_stable_value(side_df[col])
         else:
@@ -184,10 +201,28 @@ def flatten_to_match_level(df: pd.DataFrame, config: PipelineConfig, target_unit
             "blue_team_name": blue_payload.get("teamname"),
             "blue_first_pick": blue_payload.get("firstPick"),
             "blue_ckpm_source": blue_payload.get("ckpm"),
+            "blue_result_source": blue_payload.get("result"),
+            "blue_firstblood_source": blue_payload.get("firstblood"),
+            "blue_firstdragon_source": blue_payload.get("firstdragon"),
+            "blue_dragons_source": blue_payload.get("dragons"),
+            "blue_firstherald_source": blue_payload.get("firstherald"),
+            "blue_heralds_source": blue_payload.get("heralds"),
+            "blue_firstbaron_source": blue_payload.get("firstbaron"),
+            "blue_barons_source": blue_payload.get("barons"),
+            "blue_golddiffat15_source": blue_payload.get("golddiffat15"),
             "red_team_id": red_payload.get("teamid"),
             "red_team_name": red_payload.get("teamname"),
             "red_first_pick": red_payload.get("firstPick"),
             "red_ckpm_source": red_payload.get("ckpm"),
+            "red_result_source": red_payload.get("result"),
+            "red_firstblood_source": red_payload.get("firstblood"),
+            "red_firstdragon_source": red_payload.get("firstdragon"),
+            "red_dragons_source": red_payload.get("dragons"),
+            "red_firstherald_source": red_payload.get("firstherald"),
+            "red_heralds_source": red_payload.get("heralds"),
+            "red_firstbaron_source": red_payload.get("firstbaron"),
+            "red_barons_source": red_payload.get("barons"),
+            "red_golddiffat15_source": red_payload.get("golddiffat15"),
             "target_gamelength_seconds": gamelength_seconds,
             "target_gamelength_minutes": gamelength_seconds / 60.0,
         }
